@@ -21,8 +21,9 @@ macOS:   /Users/me/Desktop/shot.png
 
 | 本机平台 | 状态 | CI |
 | --- | --- | --- |
-| Windows | 正式支持 | `windows-latest` test + release build |
-| macOS | 正式支持 | `macos-latest` test + release build |
+| Windows x86_64 | 正式支持 | `windows-latest` test + release build |
+| macOS Apple Silicon / arm64 | 正式支持 | `macos-latest` test + release build |
+| macOS Intel / x86_64 | 正式支持 | `macos-15-intel` test + release build |
 | Linux | 代码兼容性测试 | `ubuntu-latest` test |
 
 远端以 Linux/Ubuntu + `trz` 为主要目标环境。
@@ -63,6 +64,8 @@ winget install tssh
 
 ### macOS
 
+支持 Apple Silicon 和 Intel Mac。
+
 - Alacritty
 - `tssh`（Homebrew 包名为 `trzsz-ssh`）在 `PATH` 中
 - Rust stable（仅从源码安装时需要）
@@ -96,6 +99,8 @@ Windows PowerShell 或 macOS shell 都可以直接从 GitHub 编译安装：
 ```text
 cargo install --git https://github.com/v0v0/alacritty-agent-drop.git
 ```
+
+`cargo install` 会针对当前机器的原生架构编译；Apple Silicon 和 Intel Mac 不需要不同的安装命令。
 
 安装后确认：
 
@@ -148,13 +153,19 @@ Windows：
 agentdrop dev --tssh C:\Tools\tssh.exe
 ```
 
-macOS：
+Apple Silicon Mac 的 Homebrew 默认前缀通常是 `/opt/homebrew`：
 
 ```zsh
 agentdrop dev --tssh /opt/homebrew/bin/tssh
 ```
 
-Intel Mac 的 Homebrew 默认路径通常是 `/usr/local/bin/tssh`；如果 `tssh` 已在 `PATH` 中，不需要指定 `--tssh`。
+Intel Mac 的 Homebrew 默认前缀通常是 `/usr/local`：
+
+```zsh
+agentdrop dev --tssh /usr/local/bin/tssh
+```
+
+如果 `tssh` 已在 `PATH` 中，不需要指定 `--tssh`。
 
 ## 与 tmux / zsh 的关系
 
@@ -223,7 +234,7 @@ cargo test
 cargo build --release
 ```
 
-CI 在 Windows、macOS 和 Ubuntu 上执行 Rust 测试，并分别在 Windows/macOS job 构建 release binary artifact。
+CI 在 Windows、macOS Apple Silicon、macOS Intel 和 Ubuntu 上执行 Rust 测试，并分别构建 Windows、macOS arm64、macOS x86_64 release binary artifact。
 
 ## License
 
