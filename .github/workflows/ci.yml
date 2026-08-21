@@ -9,7 +9,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -28,3 +28,15 @@ jobs:
         with:
           name: agentdrop-windows-x86_64
           path: target/release/agentdrop.exe
+
+  macos-release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentdrop-macos
+          path: target/release/agentdrop
