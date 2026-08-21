@@ -1,0 +1,23 @@
+[package]
+name = "alacritty-agent-drop"
+version = "0.1.0"
+edition = "2024"
+description = "Drag local Windows files into remote agent CLIs through Alacritty and tssh"
+license = "MIT"
+repository = "https://github.com/v0v0/alacritty-agent-drop"
+
+[[bin]]
+name = "agentdrop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+portable-pty = "0.9"
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
