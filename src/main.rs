@@ -50,6 +50,11 @@ impl Drop for RawModeGuard {
     }
 }
 
+struct LocalFilePaste {
+    path: PathBuf,
+    trailing_space: bool,
+}
+
 fn main() {
     let exit_code = match run() {
         Ok(code) => code,
@@ -177,12 +182,19 @@ fn forward_event<W: Write>(writer: &mut W, uploader: &mut Uploader, event: Input
             writer.flush()
         }
         InputEvent::Paste(payload) => {
-            let Some(local_path) = local_file_from_paste(&payload) else {
+            let Some(local_file) = local_file_from_paste(&payload) else {
                 return write_bracketed_paste(writer, &payload);
             };
 
-            match uploader.upload(&local_path) {
-                Ok(remote_path) => write_bracketed_paste(writer, remote_path.as_bytes()),
+            match uploader.upload(&local_file.path) {
+                Ok(remote_path) => {
+                    let replacement = if local_file.trailing_space {
+                        format!("{remote_path} ")
+                    } else {
+                        remote_path
+                    };
+                    write_bracketed_paste(writer, replacement.as_bytes())
+                }
                 Err(error) => {
                     let _ = io::stderr().write_all(
                         format!("\r\n[agentdrop] upload failed: {error:#}\r\n").as_bytes(),
@@ -194,17 +206,29 @@ fn forward_event<W: Write>(writer: &mut W, uploader: &mut Uploader, event: Input
     }
 }
 
-fn local_file_from_paste(payload: &[u8]) -> Option<PathBuf> {
+fn local_file_from_paste(payload: &[u8]) -> Option<LocalFilePaste> {
     let text = std::str::from_utf8(payload).ok()?;
     let text = text.trim_end_matches(['\r', '\n']);
     if text.is_empty() || text.contains('\r') || text.contains('\n') {
         return None;
     }
 
+    // Alacritty appends one space to every DroppedFile path before paste.
+    let (text, trailing_space) = match text.strip_suffix(' ') {
+        Some(path) => (path, true),
+        None => (text, false),
+    };
     let text = strip_matching_quotes(text);
+    if text.is_empty() {
+        return None;
+    }
+
     let path = PathBuf::from(text);
     if path.is_absolute() && path.is_file() {
-        Some(path)
+        Some(LocalFilePaste {
+            path,
+            trailing_space,
+        })
     } else {
         None
     }
