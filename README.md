@@ -58,7 +58,7 @@ tssh → tmux → Codex / Claude / other TUI
 `tssh` 可用 Scoop、winget 或 Chocolatey 安装，例如：
 
 ```powershell
-inget install tssh
+winget install tssh
 ```
 
 ### macOS
