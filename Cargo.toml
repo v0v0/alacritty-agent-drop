@@ -2,7 +2,7 @@
 name = "alacritty-agent-drop"
 version = "0.1.0"
 edition = "2024"
-description = "Drag local Windows files into remote agent CLIs through Alacritty and tssh"
+description = "Drag local files into remote agent CLIs through Alacritty and tssh"
 license = "MIT"
 repository = "https://github.com/v0v0/alacritty-agent-drop"
 

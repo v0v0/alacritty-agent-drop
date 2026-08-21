@@ -213,7 +213,7 @@ fn local_file_from_paste(payload: &[u8]) -> Option<LocalFilePaste> {
         return None;
     }
 
-    // Alacritty appends one space to every DroppedFile path before paste.
+    // Alacritty appends one space to every DroppedFile path before paste on all platforms.
     let (text, trailing_space) = match text.strip_suffix(' ') {
         Some(path) => (path, true),
         None => (text, false),
@@ -247,12 +247,37 @@ fn strip_matching_quotes(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_matching_quotes;
+    use std::fs;
+
+    use uuid::Uuid;
+
+    use super::{local_file_from_paste, strip_matching_quotes};
 
     #[test]
     fn strips_shell_style_wrapping_quotes() {
         assert_eq!(strip_matching_quotes("'C:\\a b\\x.png'"), "C:\\a b\\x.png");
         assert_eq!(strip_matching_quotes("\"C:\\a b\\x.png\""), "C:\\a b\\x.png");
         assert_eq!(strip_matching_quotes("C:\\a\\x.png"), "C:\\a\\x.png");
+        assert_eq!(strip_matching_quotes("'/Users/me/a b/x.png'"), "/Users/me/a b/x.png");
+    }
+
+    #[test]
+    fn recognizes_native_absolute_file_path_with_alacritty_separator() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentdrop-test-{} dir",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).expect("create temporary test directory");
+        let path = dir.join("shot image.png");
+        fs::write(&path, b"test image placeholder").expect("create temporary test file");
+
+        let payload = format!("{} ", path.to_string_lossy());
+        let parsed = local_file_from_paste(payload.as_bytes())
+            .expect("native absolute path should be recognized");
+
+        assert_eq!(parsed.path, path);
+        assert!(parsed.trailing_space);
+
+        fs::remove_dir_all(dir).expect("remove temporary test directory");
     }
 }
