@@ -197,7 +197,7 @@ fn forward_event<W: Write>(writer: &mut W, uploader: &mut Uploader, event: Input
 fn local_file_from_paste(payload: &[u8]) -> Option<PathBuf> {
     let text = std::str::from_utf8(payload).ok()?;
     let text = text.trim_end_matches(['\r', '\n']);
-    if text.is_empty() || text.contains(['\r', '\n']) {
+    if text.is_empty() || text.contains('\r') || text.contains('\n') {
         return None;
     }
 
