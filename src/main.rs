@@ -42,7 +42,7 @@ enum Command {
         #[arg(long)]
         bridge_socket: Option<PathBuf>,
 
-        /// Start the Agent through `zsh -lic`, preserving functions/aliases/env setup from .zshrc.
+        /// Start through `zsh -lic`, preserving .zshrc functions and environment setup.
         #[arg(long)]
         zsh: bool,
 
