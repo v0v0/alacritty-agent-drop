@@ -1,5 +1,7 @@
 mod paste;
 mod uploader;
+#[cfg(windows)]
+mod windows_console;
 
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
@@ -101,6 +103,9 @@ fn run() -> Result<i32> {
         .context("failed to open child PTY writer")?;
 
     let _raw_mode = RawModeGuard::enable()?;
+    #[cfg(windows)]
+    let _vt_input = windows_console::VirtualTerminalInputGuard::enable()
+        .context("failed to enable Windows virtual terminal input")?;
 
     let output_thread = thread::spawn(move || {
         let stdout = io::stdout();

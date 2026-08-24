@@ -104,6 +104,31 @@ mod tests {
     }
 
     #[test]
+    fn forwards_control_keys_immediately() {
+        let mut parser = BracketedPasteParser::default();
+        for byte in [0x01_u8, 0x05_u8, 0x12_u8] {
+            assert_eq!(
+                parser.feed(&[byte]),
+                vec![InputEvent::Bytes(vec![byte])],
+                "control byte {byte:#04x} must not be buffered"
+            );
+        }
+    }
+
+    #[test]
+    fn forwards_arrow_sequences_once_they_diverge_from_paste_prefix() {
+        for arrow in [b'A', b'B', b'C', b'D'] {
+            let mut parser = BracketedPasteParser::default();
+            assert!(parser.feed(b"\x1b").is_empty());
+            assert!(parser.feed(b"[").is_empty());
+            assert_eq!(
+                parser.feed(&[arrow]),
+                vec![InputEvent::Bytes(vec![0x1b, b'[', arrow])]
+            );
+        }
+    }
+
+    #[test]
     fn parses_paste_across_chunks() {
         let mut parser = BracketedPasteParser::default();
         assert_eq!(parser.feed(b"abc\x1b[20"), vec![InputEvent::Bytes(b"abc".to_vec())]);
