@@ -124,36 +124,67 @@ agentdrop connect dev --tssh /opt/homebrew/bin/tssh
 
 ### 2. 远端用 proxy 启动 Agent
 
-直接测试：
+如果 Agent 是普通 PATH 中的二进制：
 
 ```zsh
 agentdrop proxy -- codex
 ```
 
-或：
-
 ```zsh
 agentdrop proxy -- claude
 ```
 
-推荐在远端 `~/.zshrc` 中包装常用 Agent：
+如果你的 `codex` / `claude` 本身是 `~/.zshrc` 中的 **zsh function**，例如用来注入代理、API key 或其他环境变量，使用：
 
 ```zsh
-codex() {
-    agentdrop proxy -- codex "$@"
+agentdrop proxy --zsh -- codex
+```
+
+```zsh
+agentdrop proxy --zsh -- claude
+```
+
+`--zsh` 会在 Agent PTY 内启动：
+
+```text
+zsh -lic '"$@"' agentdrop-proxy <agent> <args...>
+```
+
+因此 `.zshrc` 会正常加载，原有 Agent function 和环境初始化仍然生效。参数通过 positional arguments 传递，不通过字符串拼接或 `eval`。
+
+> 说明：这里保证的是 zsh **function** 和启动环境。alias 是 zsh 的词法展开，不建议把 Agent 启动逻辑只放在 alias 里。
+
+#### 推荐：保留原有 function，增加独立入口
+
+不要直接把已有的 `codex()` / `claude()` 覆盖成代理函数，否则内层 `zsh -lic` 再加载 `.zshrc` 时容易递归。
+
+推荐新增：
+
+```zsh
+codexd() {
+    agentdrop proxy --zsh -- codex "$@"
 }
 
-claude() {
-    agentdrop proxy -- claude "$@"
+clauded() {
+    agentdrop proxy --zsh -- claude "$@"
 }
 ```
 
-然后正常：
+这样原来的：
 
 ```zsh
-tmux attach
 codex
+claude
 ```
+
+完全保持原状；需要拖拽桥接时使用：
+
+```zsh
+codexd
+clauded
+```
+
+如果希望最终仍然输入 `codex` 就自动进入 proxy，建议在确认方案稳定后再做单独的 zsh integration，而不是直接覆盖原函数。
 
 `agentdrop proxy` 可以在 tmux pane 内运行，不需要修改 tmux 配置。
 
@@ -288,7 +319,7 @@ cargo test --all-targets
 cargo build --release
 ```
 
-CI 验证 Windows、macOS Apple Silicon、macOS Intel 和 Ubuntu。
+CI 验证 Windows、macOS Apple Silicon、macOS Intel 和 Ubuntu，并构建 Windows/macOS/Linux release artifact。
 
 ## License
 
