@@ -1,114 +1,85 @@
 # alacritty-agent-drop
 
-让 **Windows Explorer / macOS Finder → Alacritty → tssh → Ubuntu/tmux → Codex / Claude 等 Agent CLI** 支持类似 Wave 的拖拽文件体验。
+让 **Windows Explorer / macOS Finder → Alacritty → tssh → Ubuntu/tmux → Codex / Claude 等 Agent CLI** 支持类似 Wave 的“拖入本地文件后，Agent 获得远端可访问路径”的体验。
 
-当 Agent TUI 正在前台运行时，把本机图片或其他普通文件拖进 Alacritty：
+## 为什么改成两段式架构
 
-```text
-Windows: C:\Users\me\Desktop\shot.png
-macOS:   /Users/me/Desktop/shot.png
-```
-
-`agentdrop` 会在本机 PTY 与 `tssh` 之间拦截这个 bracketed paste，使用**第二条独立 tssh 连接**把文件上传到远端：
+`0.1.x` 曾把 `agentdrop` 放在 Alacritty 和 `tssh` 之间，透明代理整个本地 PTY：
 
 ```text
-/home/me/.cache/agentdrop/<session-id>/shot.png
+Alacritty → agentdrop PTY proxy → tssh → tmux → Agent
 ```
 
-然后把这个远端绝对路径写回当前 Agent 的输入框。当前 tmux pane、zsh 和 Agent TUI 不会被切换到 `trz`。
+这种设计会让 `agentdrop` 参与 Windows Console / ConPTY、方向键、Ctrl-A/E/R、terminal raw mode 等所有交互协议，容易破坏正常终端行为。
 
-## 支持平台
-
-| 本机平台 | 状态 | CI |
-| --- | --- | --- |
-| Windows x86_64 | 正式支持 | `windows-latest` test + release build |
-| macOS Apple Silicon / arm64 | 正式支持 | `macos-latest` test + release build |
-| macOS Intel / x86_64 | 正式支持 | `macos-15-intel` test + release build |
-| Linux | 代码兼容性测试 | `ubuntu-latest` test |
-
-远端以 Linux/Ubuntu + `trz` 为主要目标环境。
-
-## 数据流
+`0.2.x` 改成：
 
 ```text
-Explorer / Finder
-      │ drag
-      ▼
-Alacritty
-      │ bracketed paste: local absolute path
-      ▼
-agentdrop
-      │
-      ├──── tssh --upload-file ────► Ubuntu ~/.cache/agentdrop/...
-      │
-      ▼ rewrite
-/home/me/.cache/agentdrop/.../shot.png
-      │
-      ▼
-tssh → tmux → Codex / Claude / other TUI
+Windows / macOS                         Ubuntu remote
+
+Alacritty                               tmux
+   │                                      │
+   │ native terminal I/O                  ▼
+   ▼                                agentdrop proxy
+agentdrop connect                         │
+   │                                      ▼
+   └──── exec tssh directly ───────────► Codex / Claude
+   │
+   └─ local upload bridge
+          ▲
+          │ SSH RemoteForward (Unix socket, mode 0600)
+          └──────────────────────────── agentdrop proxy
 ```
 
-## 前置条件
+**本机 `agentdrop connect` 不读取、不解析、不重写 stdin/stdout。** 它只启动本地上传 bridge，然后以 inherited stdio 直接启动 `tssh`。因此方向键、Ctrl-A、Ctrl-E、Ctrl-R、tmux shortcut 等全部由 Alacritty + tssh 原生处理。
 
-### Windows
+只有远端 `agentdrop proxy` 包住 Agent CLI，职责与之前的 `wave-paste-proxy` 类似：识别 bracketed paste 中的 Windows/macOS 本地路径，请求本机 bridge 上传，然后把远端绝对路径写入 Agent 输入框。
+
+## 要求
+
+### 本机 Windows / macOS
 
 - Alacritty
-- `tssh`（trzsz-ssh）在 `PATH` 中
-- Rust stable（仅从源码安装时需要）
+- `tssh` / trzsz-ssh **0.1.23+**（需要 RemoteForward Unix socket 支持）
+- Rust stable（从源码安装时）
 
-`tssh` 可用 Scoop、winget 或 Chocolatey 安装，例如：
+Windows：
 
 ```powershell
 winget install tssh
 ```
 
-### macOS
-
-支持 Apple Silicon 和 Intel Mac。
-
-- Alacritty
-- `tssh`（Homebrew 包名为 `trzsz-ssh`）在 `PATH` 中
-- Rust stable（仅从源码安装时需要）
+macOS：
 
 ```zsh
 brew install trzsz-ssh
 ```
 
-Homebrew 安装后实际命令仍然是：
+### 远端 Ubuntu / Linux
 
-```zsh
-tssh --version
-```
+- `trz` 可执行文件在 `PATH`
+- `agentdrop` 安装在远端
+- Agent CLI（Codex、Claude Code 等）
 
-### Ubuntu 远端
-
-远端需要安装 `trz`：
+确认：
 
 ```zsh
 trz --version
 ```
 
-你的正常 `tssh dev` 登录需要已经可用。
+## 安装
 
-由于文件上传使用额外的短连接，推荐使用 SSH key、agent，或者 tssh 已保存的认证信息，避免辅助连接需要重新交互输入密码。
-
-## 安装 agentdrop
-
-Windows PowerShell 或 macOS shell 都可以直接从 GitHub 编译安装：
+本机和远端都可以安装同一个 Rust crate：
 
 ```text
-cargo install --git https://github.com/v0v0/alacritty-agent-drop.git
+cargo install --git https://github.com/v0v0/alacritty-agent-drop.git --force
 ```
 
-`cargo install` 会针对当前机器的原生架构编译；Apple Silicon 和 Intel Mac 不需要不同的安装命令。
-
-安装后确认：
-
-```text
-agentdrop --version
-```
+本机使用 `connect` 模式，远端 Ubuntu 使用 `proxy` 模式。
 
 ## 使用
+
+### 1. 本机连接远端
 
 原来：
 
@@ -116,125 +87,239 @@ agentdrop --version
 tssh dev
 ```
 
-改为：
+改成：
 
 ```text
-agentdrop dev
+agentdrop connect dev
 ```
 
-然后远端照常：
-
-```zsh
-tmux attach
-codex
-```
-
-此时可直接从 Windows Explorer 或 macOS Finder 把文件拖入 Codex/Claude 的输入区域。上传成功后，Agent 收到的是 Ubuntu 上的绝对路径，而不是本机路径。
-
-### 额外 tssh 参数
-
-放在 `--` 后面；`agentdrop` 会把它们插到 destination 之前：
+额外 tssh 参数放在 `--` 后：
 
 ```text
-agentdrop dev -- -A
+agentdrop connect dev -- -A
 ```
 
-等价于交互连接：
-
-```text
-tssh -A dev
-```
-
-### 自定义 tssh 路径
-
-Windows：
+自定义 tssh 路径：
 
 ```powershell
-agentdrop dev --tssh C:\Tools\tssh.exe
+agentdrop connect dev --tssh C:\Tools\tssh.exe
 ```
-
-Apple Silicon Mac 的 Homebrew 默认前缀通常是 `/opt/homebrew`：
 
 ```zsh
-agentdrop dev --tssh /opt/homebrew/bin/tssh
+agentdrop connect dev --tssh /opt/homebrew/bin/tssh
 ```
 
-Intel Mac 的 Homebrew 默认前缀通常是 `/usr/local`：
+`connect` 实际会给主 tssh 连接增加：
+
+```text
+-o EnableDragFile=no
+-o StreamLocalBindUnlink=yes
+-o StreamLocalBindMask=0177
+-R /tmp/agentdrop-<uuid>.sock:127.0.0.1:<local-random-port>
+```
+
+这里主动关闭 `tssh` 自带 `EnableDragFile`。原因是 tssh 的原生拖拽实现会向当前 pane 发送 Ctrl-C，再运行 `trz`；如果 Codex/Claude 正在前台，会中断 Agent。
+
+手工在 shell 中运行 `trz` / `tsz` 的能力不受影响。
+
+### 2. 远端用 proxy 启动 Agent
+
+如果 Agent 是普通 PATH 中的二进制：
 
 ```zsh
-agentdrop dev --tssh /usr/local/bin/tssh
+agentdrop proxy -- codex
 ```
-
-如果 `tssh` 已在 `PATH` 中，不需要指定 `--tssh`。
-
-## 与 tmux / zsh 的关系
-
-`agentdrop` 位于本机：
-
-```text
-Alacritty → agentdrop → PTY → tssh → Ubuntu → tmux → zsh/Agent
-```
-
-因此不需要修改远端 `.zshrc`，也不需要修改 tmux 配置。
-
-上传不会在当前 tmux pane 中执行 `trz`。它使用：
-
-```text
-connection A: agentdrop → tssh → tmux → Agent TUI
-connection B: agentdrop → tssh --upload-file → trz → cache directory
-```
-
-这也是它能在 Agent CLI 正占用前台 PTY 时工作的原因。
-
-## 路径识别规则
-
-采用保守策略。只有同时满足以下条件才触发上传：
-
-1. 输入是 terminal bracketed paste；
-2. paste 内容只有一个路径；
-3. 路径是本机绝对路径；
-4. 路径指向一个真实的普通文件。
-
-Windows 的 `C:\...` 和 macOS 的 `/Users/...` 都通过本机 `PathBuf` 原生解析，不做平台间路径转换。
-
-Alacritty 的 dropped-file 事件会在路径后附加一个空格；`agentdrop` 会识别这个分隔符，并在替换成远端路径后保留它。
-
-因此普通代码/文本粘贴不会被改写。
-
-> 终端层无法区分“拖拽产生的 paste”和“用户手工粘贴一个本地文件路径”。所以手工粘贴一个真实的本地文件绝对路径也会触发上传，这是预期行为。
-
-如果上传失败，原始 paste 会继续传给 Agent，不会吞掉输入，同时终端会输出一条 `[agentdrop] upload failed` 错误。
-
-## 远端文件位置
-
-每次启动 `agentdrop` 会创建独立目录：
-
-```text
-$HOME/.cache/agentdrop/<uuid>/
-```
-
-权限通过 `umask 077` 创建。当前不会自动删除这些文件，因为 Agent 可能在会话结束前后仍需要访问它们；可自行周期清理：
 
 ```zsh
-find ~/.cache/agentdrop -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf -- {} +
+agentdrop proxy -- claude
+```
+
+如果你的 `codex` / `claude` 本身是 `~/.zshrc` 中的 **zsh function**，例如用来注入代理、API key 或其他环境变量，使用：
+
+```zsh
+agentdrop proxy --zsh -- codex
+```
+
+```zsh
+agentdrop proxy --zsh -- claude
+```
+
+`--zsh` 会在 Agent PTY 内启动：
+
+```text
+zsh -lic '"$@"' agentdrop-proxy <agent> <args...>
+```
+
+因此 `.zshrc` 会正常加载，原有 Agent function 和环境初始化仍然生效。参数通过 positional arguments 传递，不通过字符串拼接或 `eval`。
+
+> 说明：这里保证的是 zsh **function** 和启动环境。alias 是 zsh 的词法展开，不建议把 Agent 启动逻辑只放在 alias 里。
+
+#### 推荐：保留原有 function，增加独立入口
+
+不要直接把已有的 `codex()` / `claude()` 覆盖成代理函数，否则内层 `zsh -lic` 再加载 `.zshrc` 时容易递归。
+
+推荐新增：
+
+```zsh
+codexd() {
+    agentdrop proxy --zsh -- codex "$@"
+}
+
+clauded() {
+    agentdrop proxy --zsh -- claude "$@"
+}
+```
+
+这样原来的：
+
+```zsh
+codex
+claude
+```
+
+完全保持原状；需要拖拽桥接时使用：
+
+```zsh
+codexd
+clauded
+```
+
+如果希望最终仍然输入 `codex` 就自动进入 proxy，建议在确认方案稳定后再做单独的 zsh integration，而不是直接覆盖原函数。
+
+`agentdrop proxy` 可以在 tmux pane 内运行，不需要修改 tmux 配置。
+
+## 拖拽时发生什么
+
+例如 Codex 正在前台，从 Windows Explorer 拖：
+
+```text
+C:\Users\me\Desktop\shot.png
+```
+
+流程：
+
+```text
+1. Alacritty 把本地路径作为 bracketed paste 发送
+2. tssh 原样透传，不做 drag upload
+3. Ubuntu 上的 agentdrop proxy 看到 C:\... 本地路径
+4. proxy 连接 /tmp/agentdrop-*.sock
+5. SSH RemoteForward 把请求转回本机 agentdrop bridge
+6. 本机 bridge 验证文件真实存在
+7. bridge 另开一条 tssh --upload-file 连接上传
+8. 保存到：
+   $HOME/.cache/agentdrop/files/<session>/<request>/shot.png
+9. proxy 收到相对路径，在 Ubuntu 解析成绝对路径
+10. Codex 输入框最终收到：
+    /home/me/.cache/agentdrop/files/.../shot.png
+```
+
+当前 Agent TUI 不会被切换到 `trz`，主 SSH 连接也不会被上传协议占用。
+
+macOS Finder 的 `/Users/...` 路径采用同一机制。如果一个 Unix 绝对路径本身已经存在于远端，proxy 会认为它是正常远端路径，不触发上传。
+
+## 为什么键盘行为不会再被本机 agentdrop 破坏
+
+`connect` 使用标准 `std::process::Command`：
+
+```text
+stdin  = inherit
+stdout = inherit
+stderr = inherit
+```
+
+因此：
+
+```text
+Alacritty keyboard event
+        ↓
+tssh 自己的 Windows/macOS terminal implementation
+        ↓
+SSH
+        ↓
+tmux
+```
+
+本机 `agentdrop` 不再调用 `enable_raw_mode()`，不创建 ConPTY/portable-pty，也不解析 `ESC[A` 或 Ctrl 控制字节。
+
+远端 proxy 仍然需要一个 PTY，因为 Codex/Claude 是 TUI；但这个代理运行在 Ubuntu Unix PTY 上，而且只包住 Agent 进程，不影响 SSH/tmux 的全局终端语义。
+
+## bridge socket 发现
+
+默认情况下，远端 proxy 会扫描：
+
+```text
+/tmp/agentdrop-*.sock
+```
+
+并优先尝试最新且可连接的 socket。
+
+如果同一远端账号同时开了多条 `agentdrop connect`，可显式指定：
+
+```zsh
+agentdrop proxy --bridge-socket /tmp/agentdrop-<uuid>.sock -- codex
+```
+
+或：
+
+```zsh
+export AGENTDROP_BRIDGE_SOCKET=/tmp/agentdrop-<uuid>.sock
+```
+
+## 安全边界
+
+RemoteForward socket 使用：
+
+```text
+StreamLocalBindMask=0177
+```
+
+因此远端 socket 权限为当前 Unix 用户私有（0600）。其他远端用户无法通过该 socket 请求本机上传。
+
+但要注意：**与 Agent 同一个远端 Unix 账号运行的其他进程，也处于相同信任边界内。** 它们如果能够连接这个 socket，并知道一个本机绝对路径，也可以请求 bridge 上传该文件。不要在不可信的远端账号或共享账号中启用此 bridge。
+
+bridge 只接受“本机存在的普通文件”，当前不支持目录。
+
+## side-channel 上传认证
+
+上传使用第二条短连接：
+
+```text
+tssh --upload-file <local-file> dev 'trz ...'
+```
+
+因此推荐使用 SSH key、ssh-agent、Pageant 或 tssh 已保存的认证信息。否则每次拖文件都可能需要重新认证。
+
+## 远端缓存
+
+文件保存到：
+
+```text
+$HOME/.cache/agentdrop/files/<session>/<request>/
+```
+
+当前不自动删除。可以周期清理：
+
+```zsh
+find ~/.cache/agentdrop/files -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf -- {} +
 ```
 
 ## 当前限制
 
-- 只自动上传普通文件，不上传目录。
-- 依赖 Agent/TUI 开启 bracketed paste；Codex、Claude 等现代 TUI 通常会启用。
-- 辅助上传连接需要能独立完成认证。
-- 文件名需要能够表示为 UTF-8。
-- 本项目不会解析 Agent 私有协议；它只把远端绝对路径插入当前输入流，因此可复用于不同 Agent CLI。
+- 自动桥接普通文件，不上传目录。
+- 依赖 Agent/TUI 开启 bracketed paste。
+- 本地文件名需要能够表示为 UTF-8。
+- side-channel 需要能独立完成 SSH 认证。
+- 同一远端 Unix 用户被视为信任边界。
+- `proxy` 模式面向 Unix/Linux 远端；Windows/macOS 是 `connect` 客户端平台。
 
 ## 开发
 
 ```text
-cargo test
+cargo test --all-targets
 cargo build --release
 ```
 
-CI 在 Windows、macOS Apple Silicon、macOS Intel 和 Ubuntu 上执行 Rust 测试，并分别构建 Windows、macOS arm64、macOS x86_64 release binary artifact。
+CI 验证 Windows、macOS Apple Silicon、macOS Intel 和 Ubuntu，并构建 Windows/macOS/Linux release artifact。
 
 ## License
 

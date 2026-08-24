@@ -47,3 +47,15 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: target/release/agentdrop
+
+  linux-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release binary
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentdrop-linux-x86_64
+          path: target/release/agentdrop
