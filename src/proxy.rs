@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-pub fn run(command: Vec<OsString>, bridge_socket: Option<PathBuf>) -> Result<i32> {
-    imp::run(command, bridge_socket)
+pub fn run(command: Vec<OsString>, bridge_socket: Option<PathBuf>, zsh: bool) -> Result<i32> {
+    imp::run(command, bridge_socket, zsh)
 }
 
 #[cfg(not(unix))]
@@ -14,7 +14,11 @@ mod imp {
 
     use anyhow::{Result, bail};
 
-    pub fn run(_command: Vec<OsString>, _bridge_socket: Option<PathBuf>) -> Result<i32> {
+    pub fn run(
+        _command: Vec<OsString>,
+        _bridge_socket: Option<PathBuf>,
+        _zsh: bool,
+    ) -> Result<i32> {
         bail!("agentdrop proxy is intended to run on the remote Unix/Linux host")
     }
 }
@@ -109,7 +113,7 @@ mod imp {
         }
     }
 
-    pub fn run(command: Vec<OsString>, bridge_socket: Option<PathBuf>) -> Result<i32> {
+    pub fn run(command: Vec<OsString>, bridge_socket: Option<PathBuf>, zsh: bool) -> Result<i32> {
         if command.is_empty() {
             bail!("proxy requires a command, for example: agentdrop proxy -- codex")
         }
@@ -125,15 +129,16 @@ mod imp {
             })
             .context("failed to create agent PTY")?;
 
-        let mut child_command = CommandBuilder::new(&command[0]);
-        for arg in &command[1..] {
+        let child_argv = agent_argv(&command, zsh);
+        let mut child_command = CommandBuilder::new(&child_argv[0]);
+        for arg in &child_argv[1..] {
             child_command.arg(arg);
         }
 
         let mut child = pair
             .slave
             .spawn_command(child_command)
-            .with_context(|| format!("failed to start {}", command[0].to_string_lossy()))?;
+            .with_context(|| format!("failed to start {}", child_argv[0].to_string_lossy()))?;
         drop(pair.slave);
 
         let mut child_output = pair
@@ -182,6 +187,23 @@ mod imp {
         let _ = output_thread.join();
 
         Ok(status.exit_code() as i32)
+    }
+
+    fn agent_argv(command: &[OsString], zsh: bool) -> Vec<OsString> {
+        if !zsh {
+            return command.to_vec();
+        }
+
+        // `$@` is executed as a shell command instead of through `command`/`exec`, so zsh's
+        // normal function and alias resolution remains available after `.zshrc` is loaded.
+        let mut argv = vec![
+            OsString::from("zsh"),
+            OsString::from("-lic"),
+            OsString::from("\"$@\""),
+            OsString::from("agentdrop-proxy"),
+        ];
+        argv.extend(command.iter().cloned());
+        argv
     }
 
     fn copy_interactive_output<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
@@ -393,6 +415,34 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn zsh_mode_executes_agent_as_positional_command() {
+            let command = vec![
+                OsString::from("codex"),
+                OsString::from("--model"),
+                OsString::from("gpt-5"),
+            ];
+            let argv = agent_argv(&command, true);
+            assert_eq!(
+                argv,
+                vec![
+                    OsString::from("zsh"),
+                    OsString::from("-lic"),
+                    OsString::from("\"$@\""),
+                    OsString::from("agentdrop-proxy"),
+                    OsString::from("codex"),
+                    OsString::from("--model"),
+                    OsString::from("gpt-5"),
+                ]
+            );
+        }
+
+        #[test]
+        fn direct_mode_keeps_original_argv() {
+            let command = vec![OsString::from("codex"), OsString::from("resume")];
+            assert_eq!(agent_argv(&command, false), command);
+        }
 
         #[test]
         fn recognizes_windows_drive_and_unc_paths() {
