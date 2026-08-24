@@ -33,6 +33,7 @@ mod imp {
     use std::path::{Component, Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::Duration;
 
@@ -42,6 +43,8 @@ mod imp {
 
     use crate::paste::{BracketedPasteParser, InputEvent, write_bracketed_paste};
     use crate::protocol::{PROTOCOL_VERSION, UploadRequest, UploadResponse};
+
+    const AMBIGUOUS_ESCAPE_TIMEOUT: Duration = Duration::from_millis(40);
 
     struct RawModeGuard;
 
@@ -194,8 +197,8 @@ mod imp {
             return command.to_vec();
         }
 
-        // `$@` is executed as a shell command instead of through `command`/`exec`, so zsh's
-        // normal function and alias resolution remains available after `.zshrc` is loaded.
+        // `$@` is executed as the shell command after `.zshrc` is loaded. This preserves
+        // zsh function resolution and environment setup without string-building or `eval`.
         let mut argv = vec![
             OsString::from("zsh"),
             OsString::from("-lic"),
@@ -220,32 +223,81 @@ mod imp {
 
     fn spawn_input_proxy(mut child_input: Box<dyn Write + Send>, mut bridge: BridgeClient) {
         thread::spawn(move || {
-            let stdin = io::stdin();
-            let mut stdin = stdin.lock();
-            let mut parser = BracketedPasteParser::default();
-            let mut buffer = [0_u8; 4096];
+            let (sender, receiver) = mpsc::channel::<Option<Vec<u8>>>();
 
-            loop {
-                let read = match stdin.read(&mut buffer) {
-                    Ok(0) => {
-                        for event in parser.finish() {
-                            if forward_event(&mut child_input, &mut bridge, event).is_err() {
+            // Keep the blocking terminal read in a dedicated thread. The parser thread can then
+            // time out an ambiguous `ESC` / `ESC[` prefix without making stdin non-blocking or
+            // changing tty file-status flags shared with the parent shell/tmux session.
+            thread::spawn(move || {
+                let stdin = io::stdin();
+                let mut stdin = stdin.lock();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match stdin.read(&mut buffer) {
+                        Ok(0) => {
+                            let _ = sender.send(None);
+                            return;
+                        }
+                        Ok(read) => {
+                            if sender.send(Some(buffer[..read].to_vec())).is_err() {
                                 return;
                             }
                         }
+                        Err(_) => {
+                            let _ = sender.send(None);
+                            return;
+                        }
+                    }
+                }
+            });
+
+            let mut parser = BracketedPasteParser::default();
+            loop {
+                match receiver.recv_timeout(AMBIGUOUS_ESCAPE_TIMEOUT) {
+                    Ok(Some(bytes)) => {
+                        if forward_events(
+                            &mut child_input,
+                            &mut bridge,
+                            parser.feed(&bytes),
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(None) | Err(RecvTimeoutError::Disconnected) => {
+                        let _ = forward_events(
+                            &mut child_input,
+                            &mut bridge,
+                            parser.finish(),
+                        );
                         return;
                     }
-                    Ok(read) => read,
-                    Err(_) => return,
-                };
-
-                for event in parser.feed(&buffer[..read]) {
-                    if forward_event(&mut child_input, &mut bridge, event).is_err() {
-                        return;
+                    Err(RecvTimeoutError::Timeout) => {
+                        if forward_events(
+                            &mut child_input,
+                            &mut bridge,
+                            parser.flush_ambiguous_prefix(),
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
             }
         });
+    }
+
+    fn forward_events<W: Write>(
+        writer: &mut W,
+        bridge: &mut BridgeClient,
+        events: Vec<InputEvent>,
+    ) -> io::Result<()> {
+        for event in events {
+            forward_event(writer, bridge, event)?;
+        }
+        Ok(())
     }
 
     fn forward_event<W: Write>(
