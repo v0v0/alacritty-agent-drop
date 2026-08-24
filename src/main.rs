@@ -1,3 +1,4 @@
+mod clipboard;
 mod connect;
 mod paste;
 mod protocol;
@@ -13,7 +14,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "agentdrop",
     version,
-    about = "Bridge local file drops into remote Agent CLIs without proxying the SSH terminal input"
+    about = "Bridge local file drops and clipboard images into remote Agent CLIs without proxying the SSH terminal input"
 )]
 struct Cli {
     #[command(subcommand)]
