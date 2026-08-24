@@ -52,6 +52,17 @@ impl BracketedPasteParser {
         events
     }
 
+    /// Flush bytes which are being retained only because they are an incomplete prefix of
+    /// `ESC[200~`. Callers use this after a short idle timeout so a standalone Escape key does
+    /// not wait forever. Once a real bracketed paste has started, this intentionally does nothing.
+    pub fn flush_ambiguous_prefix(&mut self) -> Vec<InputEvent> {
+        if self.in_paste || self.buffer.is_empty() {
+            return Vec::new();
+        }
+
+        vec![InputEvent::Bytes(std::mem::take(&mut self.buffer))]
+    }
+
     pub fn finish(&mut self) -> Vec<InputEvent> {
         if self.buffer.is_empty() && !self.in_paste {
             return Vec::new();
@@ -113,6 +124,27 @@ mod tests {
                 "control byte {byte:#04x} must not be buffered"
             );
         }
+    }
+
+    #[test]
+    fn releases_standalone_escape_after_idle_timeout() {
+        let mut parser = BracketedPasteParser::default();
+        assert!(parser.feed(b"\x1b").is_empty());
+        assert_eq!(
+            parser.flush_ambiguous_prefix(),
+            vec![InputEvent::Bytes(vec![0x1b])]
+        );
+    }
+
+    #[test]
+    fn does_not_flush_after_real_paste_has_started() {
+        let mut parser = BracketedPasteParser::default();
+        assert!(parser.feed(b"\x1b[200~partial").is_empty());
+        assert!(parser.flush_ambiguous_prefix().is_empty());
+        assert_eq!(
+            parser.feed(b" paste\x1b[201~"),
+            vec![InputEvent::Paste(b"partial paste".to_vec())]
+        );
     }
 
     #[test]
