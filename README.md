@@ -1,8 +1,15 @@
 # alacritty-agent-drop
 
-让 **Windows Explorer / macOS Finder → Alacritty → tssh → Ubuntu/tmux → Codex / Claude 等 Agent CLI** 支持类似 Wave 的“拖入本地文件后，Agent 获得远端可访问路径”的体验。
+让 **Windows Explorer / macOS Finder → Alacritty → tssh → Ubuntu/tmux → Codex / Claude 等 Agent CLI** 支持类似 Wave 的本地文件拖拽与截图粘贴体验。
 
-## 为什么改成两段式架构
+支持两类输入：
+
+```text
+文件拖拽：Explorer / Finder → remote file path → Agent
+截图粘贴：Win+Shift+S / macOS screenshot → clipboard image → Ctrl-V → remote PNG path → Agent
+```
+
+## 架构
 
 `0.1.x` 曾把 `agentdrop` 放在 Alacritty 和 `tssh` 之间，透明代理整个本地 PTY：
 
@@ -12,7 +19,7 @@ Alacritty → agentdrop PTY proxy → tssh → tmux → Agent
 
 这种设计会让 `agentdrop` 参与 Windows Console / ConPTY、方向键、Ctrl-A/E/R、terminal raw mode 等所有交互协议，容易破坏正常终端行为。
 
-`0.2.x` 改成：
+`0.2.x` 起改成两段式架构，`0.3.x` 在同一 side-channel 上增加 clipboard image：
 
 ```text
 Windows / macOS                         Ubuntu remote
@@ -25,15 +32,19 @@ agentdrop connect                         │
    │                                      ▼
    └──── exec tssh directly ───────────► Codex / Claude
    │
-   └─ local upload bridge
+   └─ local bridge
           ▲
           │ SSH RemoteForward (Unix socket, mode 0600)
-          └──────────────────────────── agentdrop proxy
+          └──────── file / clipboard ── agentdrop proxy
 ```
 
-**本机 `agentdrop connect` 不读取、不解析、不重写 stdin/stdout。** 它只启动本地上传 bridge，然后以 inherited stdio 直接启动 `tssh`。因此方向键、Ctrl-A、Ctrl-E、Ctrl-R、tmux shortcut 等全部由 Alacritty + tssh 原生处理。
+**本机 `agentdrop connect` 不读取、不解析、不重写 stdin/stdout。** 它只启动本地 bridge，然后以 inherited stdio 直接启动 `tssh`。方向键、Ctrl-A、Ctrl-E、Ctrl-R、tmux shortcut 等继续由 Alacritty + tssh 原生处理。
 
-只有远端 `agentdrop proxy` 包住 Agent CLI，职责与之前的 `wave-paste-proxy` 类似：识别 bracketed paste 中的 Windows/macOS 本地路径，请求本机 bridge 上传，然后把远端绝对路径写入 Agent 输入框。
+只有远端 `agentdrop proxy` 包住 Agent CLI：
+
+- bracketed paste 中出现 Windows/macOS 本地文件路径时，请求本机上传；
+- 普通 raw input 中出现 `Ctrl-V` (`0x16`) 时，请求本机读取 clipboard image；
+- 上传完成后把 Ubuntu 绝对路径作为 bracketed paste 注入 Agent。
 
 ## 要求
 
@@ -69,7 +80,7 @@ trz --version
 
 ## 安装
 
-本机和远端都可以安装同一个 Rust crate：
+本机和远端都安装同一个 crate：
 
 ```text
 cargo install --git https://github.com/v0v0/alacritty-agent-drop.git --force
@@ -118,29 +129,23 @@ agentdrop connect dev --tssh /opt/homebrew/bin/tssh
 -R /tmp/agentdrop-<uuid>.sock:127.0.0.1:<local-random-port>
 ```
 
-这里主动关闭 `tssh` 自带 `EnableDragFile`。原因是 tssh 的原生拖拽实现会向当前 pane 发送 Ctrl-C，再运行 `trz`；如果 Codex/Claude 正在前台，会中断 Agent。
+这里主动关闭 `tssh` 自带 `EnableDragFile`。tssh 的原生拖拽上传会在当前 pane 里发送 Ctrl-C 并运行 `trz`，会中断正在前台运行的 Agent TUI。
 
-手工在 shell 中运行 `trz` / `tsz` 的能力不受影响。
+手工在 shell 中运行 `trz` / `tsz` 不受影响。
 
 ### 2. 远端用 proxy 启动 Agent
 
-如果 Agent 是普通 PATH 中的二进制：
+普通 PATH 二进制：
 
 ```zsh
 agentdrop proxy -- codex
-```
-
-```zsh
 agentdrop proxy -- claude
 ```
 
-如果你的 `codex` / `claude` 本身是 `~/.zshrc` 中的 **zsh function**，例如用来注入代理、API key 或其他环境变量，使用：
+如果 `codex` / `claude` 本身是 `~/.zshrc` 中的 **zsh function**，例如用于注入代理、API key 或其他环境变量：
 
 ```zsh
 agentdrop proxy --zsh -- codex
-```
-
-```zsh
 agentdrop proxy --zsh -- claude
 ```
 
@@ -150,15 +155,11 @@ agentdrop proxy --zsh -- claude
 zsh -lic '"$@"' agentdrop-proxy <agent> <args...>
 ```
 
-因此 `.zshrc` 会正常加载，原有 Agent function 和环境初始化仍然生效。参数通过 positional arguments 传递，不通过字符串拼接或 `eval`。
+因此 `.zshrc` 会正常加载，原有 Agent function 和环境初始化仍然生效。参数使用 positional arguments，不通过字符串拼接或 `eval`。
 
-> 说明：这里保证的是 zsh **function** 和启动环境。alias 是 zsh 的词法展开，不建议把 Agent 启动逻辑只放在 alias 里。
+> 这里保证 zsh **function** 和启动环境；alias 属于词法展开，不建议把 Agent 启动逻辑只放在 alias 里。
 
-#### 推荐：保留原有 function，增加独立入口
-
-不要直接把已有的 `codex()` / `claude()` 覆盖成代理函数，否则内层 `zsh -lic` 再加载 `.zshrc` 时容易递归。
-
-推荐新增：
+推荐保留原 function，增加独立入口：
 
 ```zsh
 codexd() {
@@ -170,25 +171,68 @@ clauded() {
 }
 ```
 
-这样原来的：
-
-```zsh
-codex
-claude
-```
-
-完全保持原状；需要拖拽桥接时使用：
+需要增强能力时运行：
 
 ```zsh
 codexd
 clauded
 ```
 
-如果希望最终仍然输入 `codex` 就自动进入 proxy，建议在确认方案稳定后再做单独的 zsh integration，而不是直接覆盖原函数。
+`agentdrop proxy` 可以直接运行在 tmux pane 内，不需要修改 tmux 配置。
 
-`agentdrop proxy` 可以在 tmux pane 内运行，不需要修改 tmux 配置。
+## 截图直接 Ctrl-V
 
-## 拖拽时发生什么
+### Windows
+
+例如：
+
+```text
+Win+Shift+S
+    ↓
+框选截图，图片进入 Windows Clipboard
+    ↓
+回到 Alacritty 中正在运行的 remote Codex
+    ↓
+Ctrl-V
+```
+
+流程：
+
+```text
+1. Alacritty 把 Ctrl-V 作为 0x16 发给 tssh
+2. tssh / SSH / tmux 原样传到 Ubuntu
+3. agentdrop proxy 只在 Agent 边界识别 0x16
+4. proxy 通过 /tmp/agentdrop-*.sock 请求本机 clipboard image
+5. Windows agentdrop connect 使用系统 clipboard API 读取图片
+6. 图片编码为本机临时 PNG
+7. bridge 通过第二条 tssh --upload-file 上传 PNG
+8. 本机临时 PNG 删除
+9. Ubuntu 得到：
+   $HOME/.cache/agentdrop/files/<session>/<request>/clipboard-<uuid>.png
+10. proxy 把该 Ubuntu 绝对路径作为 bracketed paste 注入 Codex
+```
+
+最终 Codex 接收到的是远端真实存在的图片路径，而不是 Windows bitmap 或本机路径。
+
+如果本机 clipboard **没有图片**，`agentdrop proxy` 不会吞掉 Ctrl-V，而是把原始 `0x16` 转发给 Agent。
+
+### macOS
+
+本地 bridge 同样支持 macOS system clipboard image。触发协议当前仍然是远端 Agent 收到的 `Ctrl-V` (`0x16`)；macOS 常规文本粘贴继续使用 `Cmd-V`，不会经过这条 clipboard-image trigger。
+
+## 普通文本粘贴
+
+截图粘贴不会改变 Alacritty 原本的文本粘贴链路。
+
+Windows 常规文本 paste 通常仍使用：
+
+```text
+Ctrl+Shift+V
+```
+
+它会进入 bracketed paste，并直接传给 Agent；其中即使文本里包含普通字符，也不会触发 clipboard-image 请求。
+
+## 文件拖拽
 
 例如 Codex 正在前台，从 Windows Explorer 拖：
 
@@ -209,15 +253,12 @@ C:\Users\me\Desktop\shot.png
 8. 保存到：
    $HOME/.cache/agentdrop/files/<session>/<request>/shot.png
 9. proxy 收到相对路径，在 Ubuntu 解析成绝对路径
-10. Codex 输入框最终收到：
-    /home/me/.cache/agentdrop/files/.../shot.png
+10. Codex 输入框收到 remote absolute path
 ```
-
-当前 Agent TUI 不会被切换到 `trz`，主 SSH 连接也不会被上传协议占用。
 
 macOS Finder 的 `/Users/...` 路径采用同一机制。如果一个 Unix 绝对路径本身已经存在于远端，proxy 会认为它是正常远端路径，不触发上传。
 
-## 为什么键盘行为不会再被本机 agentdrop 破坏
+## 为什么键盘行为不再被本机 agentdrop 破坏
 
 `connect` 使用标准 `std::process::Command`：
 
@@ -239,13 +280,13 @@ SSH
 tmux
 ```
 
-本机 `agentdrop` 不再调用 `enable_raw_mode()`，不创建 ConPTY/portable-pty，也不解析 `ESC[A` 或 Ctrl 控制字节。
+本机 `agentdrop` 不调用 `enable_raw_mode()`，不创建 ConPTY/portable-pty，也不解析 `ESC[A`、Ctrl-A/E/R 等输入。
 
-远端 proxy 仍然需要一个 PTY，因为 Codex/Claude 是 TUI；但这个代理运行在 Ubuntu Unix PTY 上，而且只包住 Agent 进程，不影响 SSH/tmux 的全局终端语义。
+远端 proxy 需要一个 Unix PTY，因为 Codex/Claude 是 TUI。它只包住 Agent 进程，并且只对两类输入增强：bracketed-pasted 本地路径和单独的 Ctrl-V clipboard-image trigger。
 
 ## bridge socket 发现
 
-默认情况下，远端 proxy 会扫描：
+默认情况下，远端 proxy 扫描：
 
 ```text
 /tmp/agentdrop-*.sock
@@ -253,7 +294,7 @@ tmux
 
 并优先尝试最新且可连接的 socket。
 
-如果同一远端账号同时开了多条 `agentdrop connect`，可显式指定：
+同一远端账号同时开多条 `agentdrop connect` 时可显式指定：
 
 ```zsh
 agentdrop proxy --bridge-socket /tmp/agentdrop-<uuid>.sock -- codex
@@ -273,11 +314,16 @@ RemoteForward socket 使用：
 StreamLocalBindMask=0177
 ```
 
-因此远端 socket 权限为当前 Unix 用户私有（0600）。其他远端用户无法通过该 socket 请求本机上传。
+因此远端 socket 只允许当前 Unix 用户访问（0600）。
 
-但要注意：**与 Agent 同一个远端 Unix 账号运行的其他进程，也处于相同信任边界内。** 它们如果能够连接这个 socket，并知道一个本机绝对路径，也可以请求 bridge 上传该文件。不要在不可信的远端账号或共享账号中启用此 bridge。
+但必须注意：**与 Agent 同一个远端 Unix 账号运行的其他进程属于同一信任边界。** 能连接该 socket 的进程可以：
 
-bridge 只接受“本机存在的普通文件”，当前不支持目录。
+- 请求上传一个它知道绝对路径的本机普通文件；
+- 请求读取并上传当前本机 clipboard image。
+
+因此不要在不可信的远端账号、共享账号或同一账号运行不可信代码的环境中启用此 bridge。
+
+bridge 不提供任意本机文件枚举；文件上传仍要求请求方知道具体绝对路径。clipboard 请求只读取 image format，不读取 clipboard text。
 
 ## side-channel 上传认证
 
@@ -287,17 +333,25 @@ bridge 只接受“本机存在的普通文件”，当前不支持目录。
 tssh --upload-file <local-file> dev 'trz ...'
 ```
 
-因此推荐使用 SSH key、ssh-agent、Pageant 或 tssh 已保存的认证信息。否则每次拖文件都可能需要重新认证。
+推荐使用 SSH key、ssh-agent、Pageant 或 tssh 已保存的认证信息。否则每次拖文件/粘贴截图都可能需要再次认证。
 
-## 远端缓存
+## 临时文件与远端缓存
 
-文件保存到：
+clipboard image 会先写入本机系统 temp 下的：
+
+```text
+agentdrop/clipboard/clipboard-<uuid>.png
+```
+
+上传结束后立即删除该本机临时文件。
+
+远端文件保存在：
 
 ```text
 $HOME/.cache/agentdrop/files/<session>/<request>/
 ```
 
-当前不自动删除。可以周期清理：
+远端缓存当前不自动删除，可以周期清理：
 
 ```zsh
 find ~/.cache/agentdrop/files -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf -- {} +
@@ -306,11 +360,13 @@ find ~/.cache/agentdrop/files -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm
 ## 当前限制
 
 - 自动桥接普通文件，不上传目录。
-- 依赖 Agent/TUI 开启 bracketed paste。
+- clipboard image 在 Windows/macOS 本机支持；Linux `connect` 不读取桌面 clipboard。
+- 截图粘贴 trigger 当前固定为 `Ctrl-V` (`0x16`)。
+- 文件拖拽依赖 Agent/TUI 开启 bracketed paste。
 - 本地文件名需要能够表示为 UTF-8。
 - side-channel 需要能独立完成 SSH 认证。
 - 同一远端 Unix 用户被视为信任边界。
-- `proxy` 模式面向 Unix/Linux 远端；Windows/macOS 是 `connect` 客户端平台。
+- `proxy` 模式面向 Unix/Linux 远端；Windows/macOS 是主要 `connect` 客户端平台。
 
 ## 开发
 

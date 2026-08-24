@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -11,7 +12,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
-use crate::protocol::{PROTOCOL_VERSION, UploadRequest, UploadResponse};
+use crate::clipboard;
+use crate::protocol::{BridgeRequest, BridgeResponse, PROTOCOL_VERSION};
 
 #[derive(Clone)]
 struct BridgeContext {
@@ -102,18 +104,21 @@ fn handle_bridge_request(mut stream: TcpStream, context: &BridgeContext) -> Resu
         if line.len() > 64 * 1024 {
             bail!("bridge request is too large");
         }
-        serde_json::from_str::<UploadRequest>(line.trim_end()).context("invalid bridge request")?
+        serde_json::from_str::<BridgeRequest>(line.trim_end()).context("invalid bridge request")?
     };
 
-    let response = if request.version != PROTOCOL_VERSION {
-        UploadResponse::failure(format!(
+    let response = if request.version() != PROTOCOL_VERSION {
+        BridgeResponse::failure(format!(
             "protocol version mismatch: client={}, bridge={PROTOCOL_VERSION}",
-            request.version
+            request.version()
         ))
     } else {
-        match upload_local_file(context, Path::new(&request.path)) {
-            Ok(path) => UploadResponse::success(path),
-            Err(error) => UploadResponse::failure(format!("{error:#}")),
+        match request {
+            BridgeRequest::UploadPath { path, .. } => match upload_local_file(context, Path::new(&path)) {
+                Ok(path) => BridgeResponse::success(path),
+                Err(error) => BridgeResponse::failure(format!("{error:#}")),
+            },
+            BridgeRequest::ClipboardImage { .. } => handle_clipboard_image_request(context),
         }
     };
 
@@ -121,6 +126,22 @@ fn handle_bridge_request(mut stream: TcpStream, context: &BridgeContext) -> Resu
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+fn handle_clipboard_image_request(context: &BridgeContext) -> BridgeResponse {
+    let temp_path = match clipboard::capture_image_to_temp() {
+        Ok(Some(path)) => path,
+        Ok(None) => return BridgeResponse::no_clipboard_image(),
+        Err(error) => return BridgeResponse::failure(format!("{error:#}")),
+    };
+
+    let result = upload_local_file(context, &temp_path);
+    let _ = fs::remove_file(&temp_path);
+
+    match result {
+        Ok(path) => BridgeResponse::success(path),
+        Err(error) => BridgeResponse::failure(format!("{error:#}")),
+    }
 }
 
 fn upload_local_file(context: &BridgeContext, local_path: &Path) -> Result<String> {

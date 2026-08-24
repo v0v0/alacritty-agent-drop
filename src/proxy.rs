@@ -42,9 +42,12 @@ mod imp {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
     use crate::paste::{BracketedPasteParser, InputEvent, write_bracketed_paste};
-    use crate::protocol::{PROTOCOL_VERSION, UploadRequest, UploadResponse};
+    use crate::protocol::{
+        BridgeRequest, BridgeResponse, BridgeStatus, PROTOCOL_VERSION,
+    };
 
     const AMBIGUOUS_ESCAPE_TIMEOUT: Duration = Duration::from_millis(40);
+    const CTRL_V: u8 = 0x16;
 
     struct RawModeGuard;
 
@@ -81,6 +84,61 @@ mod imp {
         }
 
         fn upload(&mut self, local_path: &str) -> Result<PathBuf> {
+            let response = self.request(&BridgeRequest::upload_path(local_path))?;
+            if response.status != BridgeStatus::Success {
+                bail!("upload bridge returned unexpected status: {:?}", response.status);
+            }
+            let relative = response
+                .remote_relative_path
+                .context("upload bridge returned no remote path")?;
+            resolve_remote_path(&relative)
+        }
+
+        fn clipboard_image(&mut self) -> Result<Option<PathBuf>> {
+            let response = self.request(&BridgeRequest::clipboard_image())?;
+            match response.status {
+                BridgeStatus::Success => {
+                    let relative = response
+                        .remote_relative_path
+                        .context("clipboard bridge returned no remote path")?;
+                    Ok(Some(resolve_remote_path(&relative)?))
+                }
+                BridgeStatus::NoClipboardImage => Ok(None),
+                BridgeStatus::Error => bail!(
+                    "clipboard bridge error: {}",
+                    response.error.unwrap_or_else(|| "unknown error".to_owned())
+                ),
+            }
+        }
+
+        fn request(&mut self, request: &BridgeRequest) -> Result<BridgeResponse> {
+            let candidates = self.candidates()?;
+            if candidates.is_empty() {
+                bail!("no agentdrop bridge socket found; connect with `agentdrop connect <host>`")
+            }
+
+            let mut last_error = None;
+            for socket in candidates {
+                match request_bridge(&socket, request) {
+                    Ok(response) => {
+                        if response.status == BridgeStatus::Error {
+                            last_error = Some(anyhow::anyhow!(
+                                "{}",
+                                response.error.unwrap_or_else(|| "bridge request failed".to_owned())
+                            ));
+                            continue;
+                        }
+                        self.cached_socket = Some(socket);
+                        return Ok(response);
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+
+            Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no usable agentdrop bridge socket")))
+        }
+
+        fn candidates(&self) -> Result<Vec<PathBuf>> {
             let mut candidates = Vec::new();
             if let Some(path) = &self.explicit_socket {
                 candidates.push(path.clone());
@@ -96,23 +154,7 @@ mod imp {
                     }
                 }
             }
-
-            if candidates.is_empty() {
-                bail!("no agentdrop bridge socket found; connect with `agentdrop connect <host>`")
-            }
-
-            let mut last_error = None;
-            for socket in candidates {
-                match request_upload(&socket, local_path) {
-                    Ok(relative) => {
-                        self.cached_socket = Some(socket);
-                        return resolve_remote_path(&relative);
-                    }
-                    Err(error) => last_error = Some(error),
-                }
-            }
-
-            Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no usable agentdrop bridge socket")))
+            Ok(candidates)
         }
     }
 
@@ -306,10 +348,7 @@ mod imp {
         event: InputEvent,
     ) -> io::Result<()> {
         match event {
-            InputEvent::Bytes(bytes) => {
-                writer.write_all(&bytes)?;
-                writer.flush()
-            }
+            InputEvent::Bytes(bytes) => forward_raw_bytes(writer, bridge, &bytes),
             InputEvent::Paste(payload) => {
                 let Some(local_file) = local_path_from_paste(&payload) else {
                     return write_bracketed_paste(writer, &payload);
@@ -324,15 +363,63 @@ mod imp {
                         write_bracketed_paste(writer, replacement.as_bytes())
                     }
                     Err(error) => {
-                        let _ = io::stderr().write_all(
-                            format!("\r\n[agentdrop] upload failed: {error:#}\r\n").as_bytes(),
-                        );
-                        let _ = io::stderr().flush();
+                        show_bridge_error("upload failed", &error);
                         write_bracketed_paste(writer, &payload)
                     }
                 }
             }
         }
+    }
+
+    fn forward_raw_bytes<W: Write>(
+        writer: &mut W,
+        bridge: &mut BridgeClient,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        let mut start = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte != CTRL_V {
+                continue;
+            }
+
+            if start < index {
+                writer.write_all(&bytes[start..index])?;
+                writer.flush()?;
+            }
+
+            match bridge.clipboard_image() {
+                Ok(Some(remote_path)) => {
+                    let replacement = format!("{} ", remote_path.to_string_lossy());
+                    write_bracketed_paste(writer, replacement.as_bytes())?;
+                }
+                Ok(None) => {
+                    // There is no image in the local clipboard. Preserve the Agent's original
+                    // Ctrl-V behavior instead of stealing the key.
+                    writer.write_all(&[CTRL_V])?;
+                    writer.flush()?;
+                }
+                Err(error) => {
+                    show_bridge_error("clipboard image paste failed", &error);
+                    writer.write_all(&[CTRL_V])?;
+                    writer.flush()?;
+                }
+            }
+
+            start = index + 1;
+        }
+
+        if start < bytes.len() {
+            writer.write_all(&bytes[start..])?;
+            writer.flush()?;
+        }
+        Ok(())
+    }
+
+    fn show_bridge_error(context: &str, error: &anyhow::Error) {
+        let _ = io::stderr().write_all(
+            format!("\r\n[agentdrop] {context}: {error:#}\r\n").as_bytes(),
+        );
+        let _ = io::stderr().flush();
     }
 
     fn local_path_from_paste(payload: &[u8]) -> Option<LocalPathPaste> {
@@ -419,17 +506,13 @@ mod imp {
         Ok(candidates.into_iter().map(|(_, path)| path).collect())
     }
 
-    fn request_upload(socket: &Path, local_path: &str) -> Result<String> {
+    fn request_bridge(socket: &Path, request: &BridgeRequest) -> Result<BridgeResponse> {
         let mut stream = UnixStream::connect(socket)
             .with_context(|| format!("failed to connect bridge {}", socket.display()))?;
         stream.set_read_timeout(Some(Duration::from_secs(300)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
-        let request = UploadRequest {
-            version: PROTOCOL_VERSION,
-            path: local_path.to_owned(),
-        };
-        serde_json::to_writer(&mut stream, &request)?;
+        serde_json::to_writer(&mut stream, request)?;
         stream.write_all(b"\n")?;
         stream.flush()?;
 
@@ -438,16 +521,14 @@ mod imp {
         if reader.read_line(&mut line)? == 0 {
             bail!("upload bridge closed without a response");
         }
-        let response: UploadResponse = serde_json::from_str(line.trim_end())?;
+        let response: BridgeResponse = serde_json::from_str(line.trim_end())?;
         if response.version != PROTOCOL_VERSION {
-            bail!("upload bridge protocol mismatch");
+            bail!(
+                "upload bridge protocol mismatch: remote={}, local={PROTOCOL_VERSION}",
+                response.version
+            );
         }
-        if let Some(error) = response.error {
-            bail!("{error}");
-        }
-        response
-            .remote_relative_path
-            .context("upload bridge returned no remote path")
+        Ok(response)
     }
 
     fn resolve_remote_path(relative: &str) -> Result<PathBuf> {
@@ -522,6 +603,31 @@ mod imp {
             let payload = format!("{} ", path.display());
             assert!(local_path_from_paste(payload.as_bytes()).is_none());
             fs::remove_file(path).expect("remove remote path fixture");
+        }
+
+        #[derive(Default)]
+        struct RecordingWriter(Vec<u8>);
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn bytes_without_ctrl_v_are_unchanged() {
+            // This test protects the common terminal path: the Ctrl-V enhancement must not
+            // rewrite ordinary keys, control bytes, or escape sequences.
+            let bytes = b"abc\x01\x05\x12\x1b[A";
+            assert!(!bytes.contains(&CTRL_V));
+            let mut writer = RecordingWriter::default();
+            writer.write_all(bytes).expect("write fixture");
+            assert_eq!(writer.0, bytes);
         }
     }
 }
