@@ -105,8 +105,7 @@ fn run() -> Result<i32> {
     let output_thread = thread::spawn(move || {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        let _ = io::copy(&mut child_output, &mut stdout);
-        let _ = stdout.flush();
+        let _ = copy_interactive_output(&mut child_output, &mut stdout);
     });
 
     let stop_resize = Arc::new(AtomicBool::new(false));
@@ -143,6 +142,21 @@ fn run() -> Result<i32> {
     let _ = output_thread.join();
 
     Ok(status.exit_code() as i32)
+}
+
+fn copy_interactive_output<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+
+        writer.write_all(&buffer[..read])?;
+        // Stdout is line-buffered on terminals. A PTY often emits one character at a time,
+        // so flushing after every read is required for normal interactive echo.
+        writer.flush()?;
+    }
 }
 
 fn spawn_input_proxy(mut child_input: Box<dyn Write + Send>, mut uploader: Uploader) {
@@ -248,10 +262,59 @@ fn strip_matching_quotes(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{self, Read, Write};
 
     use uuid::Uuid;
 
-    use super::{local_file_from_paste, strip_matching_quotes};
+    use super::{copy_interactive_output, local_file_from_paste, strip_matching_quotes};
+
+    struct OneByteReader {
+        bytes: Vec<u8>,
+        offset: usize,
+    }
+
+    impl Read for OneByteReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.offset == self.bytes.len() {
+                return Ok(0);
+            }
+            buffer[0] = self.bytes[self.offset];
+            self.offset += 1;
+            Ok(1)
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushTrackingWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl Write for FlushTrackingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn flushes_each_interactive_output_chunk() {
+        let mut reader = OneByteReader {
+            bytes: b"abc".to_vec(),
+            offset: 0,
+        };
+        let mut writer = FlushTrackingWriter::default();
+
+        copy_interactive_output(&mut reader, &mut writer).expect("copy interactive output");
+
+        assert_eq!(writer.bytes, b"abc");
+        assert_eq!(writer.flushes, 3);
+    }
 
     #[test]
     fn strips_shell_style_wrapping_quotes() {
