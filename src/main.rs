@@ -42,6 +42,10 @@ enum Command {
         #[arg(long)]
         bridge_socket: Option<PathBuf>,
 
+        /// Start the Agent through `zsh -lic`, preserving functions/aliases/env setup from .zshrc.
+        #[arg(long)]
+        zsh: bool,
+
         /// Agent command and arguments, for example: `codex` or `claude`.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
@@ -69,7 +73,8 @@ fn run() -> Result<i32> {
         } => connect::run(tssh, destination, tssh_args),
         Command::Proxy {
             bridge_socket,
+            zsh,
             command,
-        } => proxy::run(command, bridge_socket),
+        } => proxy::run(command, bridge_socket, zsh),
     }
 }
