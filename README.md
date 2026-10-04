@@ -32,32 +32,55 @@ brew install trzsz-ssh
 
 尚未打版本 tag 时，可以从本仓库 `ci` workflow 的 Artifacts 下载对应系统的压缩包。Windows 为 `agentdrop.exe`；macOS 分 arm64 和 x86_64；Linux 为 x86_64。macOS 系统剪贴板需要在用户桌面会话中使用。
 
-## 推荐：一条命令启动
+## 推荐：保留你自己的 tmux 使用方式
+
+在远端 Linux 的 `~/.zshrc` **末尾**加一行（放在已有 codex / claude function 定义之后）：
+
+```zsh
+eval "$(agentdrop init zsh)"
+```
+
+重新打开 shell，或在已有 pane 中执行一次该行。之后本机连接：
+
+```sh
+agentdrop connect dev
+```
+
+进入远端后继续使用原来的命令：
+
+```sh
+tmux attach -t work
+# 自己创建/选择 session、window、pane，然后直接运行：
+codex
+# 或 claude
+```
+
+**这条路径不创建 session/window，不自动 attach/detach，不修改 tmux 配置或环境。** 原有布局和快捷键由你管理。代理仅在 Agent 边界处理拖拽/截图；已有 `.zshrc` function 在子 zsh 中照常加载，参数保持原样。
+
+Linux 上每次请求只读查询当前 tmux session 的客户端 PID，从 `/proc/<client-pid>/environ` 取当前连接绑定，所以旧 pane、普通 attach 和重连都不依赖 pane 的陈旧环境。多个附着客户端时拒绝自动路由；一个客户端分离后会重新读取剩余客户端，不使用最后 attach 留下的 session 环境。
+
+必须能读取同账号 tmux 客户端的 `/proc` 环境；权限限制时给出错误，可显式指定 `proxy --bridge`。嵌套 tmux、共享/链接窗口和多客户端同时输入暂不支持。已有的、未通过 proxy 启动的 Agent 需要重启一次，不能给正在运行的进程热加代理。
+
+只安装 `trzsz` 并运行原版 `tssh` 不会自动开启本项目的 Agent/剪贴板增强。本机仍需 `agentdrop connect`；可自行给它设置 `adssh` 等快捷入口。`trz` / `tsz` 手动上传下载仍可使用。本项目连接中关闭了 tssh 的原生自动拖拽，防止它向前台 Agent 发送 Ctrl-C。
+
+目前自动 shell 包装支持 zsh；使用 bash/fish 的用户可在自己的 tmux pane 内显式运行 `agentdrop proxy -- codex`。无需 shell 包装时也可一直使用显式 proxy。
+
+## 可选：一条命令启动 Agent
 
 ```sh
 agentdrop run dev -- codex
-agentdrop run dev -- claude
+agentdrop run dev --zsh -- codex
 ```
 
-`dev` 是你已有的 SSH Host 别名，原有密钥、跳板机和 SSH 配置继续使用。
+`dev` 是已有 SSH Host 别名。`--zsh` 用于 `.zshrc` 中的 Agent function。
 
-需要断线后保留 Agent：
+此前的托管入口仍保留为显式可选功能：
 
 ```sh
 agentdrop run dev --tmux coding -- codex
 ```
 
-断线或 `Ctrl-B D` 分离后，再执行**同一命令**重连。已有 Agent 进程会继续运行，粘贴通道切换到本次连接；已有 session 不会重新执行命令参数。不同任务或电脑使用不同名字，例如 `--tmux coding-mac`。
-
-已有 session 仍有客户端连接时，`agentdrop` 会拒绝接管；先分离旧客户端。如果网络断开但服务器尚未发现断线，需要等 SSH 断线检测或手工分离旧客户端。
-
-如果 `codex` / `claude` 是 `.zshrc` 中的 function：
-
-```sh
-agentdrop run dev --tmux coding --zsh -- codex
-```
-
-`--zsh` 在远端加载 `.zshrc`，通过 positional arguments 执行函数并保留参数，不拼接 `eval`。不保证 shell alias；请使用 function 或可执行文件。
+只有选择 `--tmux` / `agentdrop attach` 时，本项目才创建或附着专用 session。未使用这些选项时不会管理 tmux 的生命周期。
 
 ## 拖文件与截图
 
@@ -88,13 +111,7 @@ agentdrop proxy -- codex
 agentdrop proxy --zsh -- claude
 ```
 
-需要 tmux 时推荐直接从本机使用 `run --tmux`。也可以在上述远端 shell 中使用：
-
-```sh
-agentdrop attach --session coding -- codex
-```
-
-不要依赖普通 `tmux attach` 自动更新桥接变量；由 `agentdrop attach` 管理绑定和重连。同一 tmux session 有多个客户端时，自动上传和取图会报错，不猜测来源。直接代理和不同 tmux session 相互独立。
+在 Linux 远端可以直接使用普通 `tmux attach`，不需要 `agentdrop attach` 或修改 `update-environment`。macOS 等非 Linux 远端目前仍使用旧的显式绑定/托管方式；主要远端支持目标是 Linux。
 
 ## 连接参数
 

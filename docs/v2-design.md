@@ -45,13 +45,18 @@
 
 头版本为 3。主 SSH 已提供传输加密和完整性；长度和 EOF 校验检测应用层截断/越界。文件传输使用有界 copy 缓冲；截图编码依然需要本机 RGBA 图像内存。文件必须在传输期间保持稳定；不提供可变文件快照语义。
 
-## tmux 路由
+## tmux 路由（更新）
+
+默认推荐被动集成，完整说明见 [不接管 tmux 的方案](tmux-independent.md)。Linux proxy 每次只读查询客户端 PID 和该进程的 `/proc` 环境；普通 tmux attach、旧 pane 和重新连接均无需管理 session/window 或 set-environment。`agentdrop init zsh` 提供可选的自动 Agent 包装。
+
+以下托管流程仅在用户明确使用 `--tmux` / `attach` 时适用：
+
 
 `run --tmux NAME` 调用远端 `attach`：新建专用 session 或连接已有且分离的 session，设置该 session 的单一绑定，然后 attach。已有 Agent 不重启。
 
-proxy 每次请求从当前 tmux session environment 取绑定，不缓存启动时的旧值，因此重连后仍运行的 Agent 可以使用新连接。一个 session 只支持一个附着客户端；多个客户端时拒绝自动路由。不同电脑/任务使用不同 session 名。
+Linux proxy 每次从当前唯一客户端进程读取绑定；非 Linux 远端的旧托管路径仍读取 session environment。一个 session 只支持一个附着客户端；多个客户端时拒绝自动路由。不同电脑/任务使用不同 session 名。
 
-`--bridge socket:token` 是高级显式覆盖选项，绕过自动 session 选择；调用者负责指定正确来源。普通手工 tmux attach 不受管理，不承诺更新绑定。嵌套 SSH、嵌套 tmux、共享/链接窗口和多客户端协同不是本次支持目标。
+`--bridge socket:token` 是高级显式覆盖选项，绕过自动 session 选择；调用者负责指定正确来源。Linux 支持普通手工 tmux attach，完全不需要写入 tmux 环境；非 Linux 的被动模式尚未实现。嵌套 SSH、嵌套 tmux、共享/链接窗口和多客户端协同不是本次支持目标。
 
 ## 权限与故障边界
 

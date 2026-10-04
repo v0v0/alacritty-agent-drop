@@ -5,6 +5,7 @@ mod paths;
 mod protocol;
 mod proxy;
 mod session;
+mod shell_integration;
 mod transfer;
 
 use anyhow::Result;
@@ -61,6 +62,11 @@ impl Connection {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print opt-in shell integration; source it at the end of your remote .zshrc
+    Init {
+        #[arg(value_parser = ["zsh"])]
+        shell: String,
+    },
     /// Open a remote login shell with a bound bridge
     Connect {
         #[command(flatten)]
@@ -115,6 +121,10 @@ fn main() {
 }
 fn run() -> Result<i32> {
     match Cli::parse().command {
+        Command::Init { shell: _ } => {
+            print!("{}", shell_integration::ZSH);
+            Ok(0)
+        }
         Command::Connect {
             connection,
             tssh_args,

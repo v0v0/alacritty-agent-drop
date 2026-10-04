@@ -67,36 +67,104 @@ pub fn current_endpoint(explicit: Option<&str>) -> Result<Endpoint> {
         return Endpoint::parse(endpoint);
     }
     if let Some(pane) = std::env::var_os("TMUX_PANE") {
-        // Resolve at every request, so an already-running Agent survives a reconnect.
-        let clients = Command::new("tmux")
-            .args(["list-clients", "-t"])
-            .arg(&pane)
-            .args(["-F", "#{client_name}"])
-            .output()?;
-        if !clients.status.success() {
-            bail!("cannot resolve tmux session clients");
+        // tmux clients inherit the connection environment even when the pane/server
+        // predates SSH. Read the attached client on every request, never mutate tmux.
+        #[cfg(target_os = "linux")]
+        {
+            let client_pid = || -> Result<u32> {
+                let output = Command::new("tmux")
+                    .args(["list-clients", "-t"])
+                    .arg(&pane)
+                    .args(["-F", "#{client_pid}"])
+                    .output()?;
+                if !output.status.success() {
+                    bail!("cannot resolve tmux clients");
+                }
+                single_client_pid(std::str::from_utf8(&output.stdout)?)
+            };
+            let pid = client_pid()?;
+            let endpoint = linux_client_endpoint(pid)?;
+            if client_pid()? != pid {
+                bail!("tmux client changed during bridge lookup; retry the paste");
+            }
+            return Ok(endpoint);
         }
-        if String::from_utf8_lossy(&clients.stdout).lines().count() != 1 {
-            bail!("tmux needs exactly one attached client for automatic clipboard/file routing");
-        }
-        let output = Command::new("tmux")
-            .args(["show-environment", "-t"])
-            .arg(pane)
-            .arg(BRIDGE_ENV)
-            .output()?;
-        if !output.status.success() {
-            bail!(
-                "tmux bridge is not bound; reconnect using `agentdrop run HOST --tmux NAME -- AGENT`"
+        #[cfg(not(target_os = "linux"))]
+        {
+            let clients = Command::new("tmux")
+                .args(["list-clients", "-t"])
+                .arg(&pane)
+                .args(["-F", "#{client_name}"])
+                .output()?;
+            if !clients.status.success()
+                || String::from_utf8_lossy(&clients.stdout).lines().count() != 1
+            {
+                bail!(
+                    "tmux needs exactly one attached client for automatic clipboard/file routing"
+                );
+            }
+            let output = Command::new("tmux")
+                .args(["show-environment", "-t"])
+                .arg(pane)
+                .arg(BRIDGE_ENV)
+                .output()?;
+            if !output.status.success() {
+                bail!("outside Linux, use `agentdrop run --tmux` or an explicit --bridge");
+            }
+            return Endpoint::parse(
+                std::str::from_utf8(&output.stdout)?
+                    .trim_end()
+                    .strip_prefix("AGENTDROP_BRIDGE=")
+                    .context("tmux bridge is unset")?,
             );
         }
-        let text = std::str::from_utf8(&output.stdout)?;
-        return Endpoint::parse(
-            text.trim_end()
-                .strip_prefix("AGENTDROP_BRIDGE=")
-                .context("tmux bridge is unset")?,
-        );
     }
     Endpoint::parse(&std::env::var(BRIDGE_ENV).context("no bridge binding; connect using `agentdrop connect HOST` or `agentdrop run HOST -- AGENT`")?)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn single_client_pid(text: &str) -> Result<u32> {
+    let clients: Vec<_> = text.lines().collect();
+    if clients.len() != 1 {
+        bail!("tmux needs exactly one attached client for automatic clipboard/file routing");
+    }
+    let pid: u32 = clients[0].parse().context("invalid tmux client PID")?;
+    if pid <= 1 {
+        bail!("invalid tmux client PID");
+    }
+    Ok(pid)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn endpoint_from_environ(bytes: &[u8]) -> Result<Endpoint> {
+    for entry in bytes.split(|b| *b == 0) {
+        if let Some(value) = entry.strip_prefix(b"AGENTDROP_BRIDGE=") {
+            return Endpoint::parse(
+                std::str::from_utf8(value).context("invalid bridge environment")?,
+            );
+        }
+    }
+    bail!(
+        "attached tmux client has no bridge; connect using `agentdrop connect HOST`, then attach normally"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_client_endpoint(pid: u32) -> Result<Endpoint> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::File::open(format!("/proc/{pid}/environ")).context(
+        "cannot read tmux client environment; check /proc permissions or use explicit --bridge",
+    )?;
+    if file.metadata()?.uid() != unsafe { libc::geteuid() } {
+        bail!("tmux client belongs to another user");
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        bail!("tmux client environment is too large");
+    }
+    endpoint_from_environ(&bytes)
 }
 
 #[cfg(unix)]
@@ -177,6 +245,25 @@ pub fn attach(_session: &str, _command: Vec<OsString>, _zsh: bool) -> Result<i32
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn passive_client_lookup_rejects_ambiguity_and_missing_binding() {
+        assert_eq!(single_client_pid("123\n").unwrap(), 123);
+        for value in ["", "1\n", "123\n456\n", "bad\n"] {
+            assert!(single_client_pid(value).is_err());
+        }
+        let endpoint = Endpoint::fresh();
+        let env = format!(
+            "PATH=/bin\0OTHER=value\0AGENTDROP_BRIDGE={}\0",
+            endpoint.encode()
+        );
+        assert_eq!(
+            endpoint_from_environ(env.as_bytes()).unwrap().encode(),
+            endpoint.encode()
+        );
+        assert!(endpoint_from_environ(b"PATH=/bin\0").is_err());
+        assert!(endpoint_from_environ(b"AGENTDROP_BRIDGE=invalid\0").is_err());
+    }
+
     #[test]
     fn endpoint_roundtrip_and_session_validation() {
         let endpoint = Endpoint::fresh();

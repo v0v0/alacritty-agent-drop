@@ -62,7 +62,8 @@ macOS 用 `shasum -a 256 -c <压缩包>.sha256` 校验，解压后将 `agentdrop
 完成两端安装后，在本机执行：
 
 ```sh
-agentdrop run dev --tmux coding -- codex
+agentdrop connect dev
+# 远端一次性设置 init zsh 后，正常 tmux attach 和 codex 即可
 ```
 
 ## 失败与重试

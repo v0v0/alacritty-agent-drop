@@ -133,6 +133,7 @@ mod imp {
 
         let child_argv = agent_argv(&command, zsh);
         let mut child_command = CommandBuilder::new(&child_argv[0]);
+        child_command.env("AGENTDROP_PROXY_ACTIVE", "1");
         for arg in &child_argv[1..] {
             child_command.arg(arg);
         }

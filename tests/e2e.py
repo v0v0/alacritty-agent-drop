@@ -30,6 +30,7 @@ class Terminal:
     def __init__(self, command, env):
         self.pid, self.fd = pty.fork()
         self.output = b""
+        self.closed = False
         if self.pid == 0:
             os.execve(command[0], command, env)
 
@@ -51,6 +52,9 @@ class Terminal:
         os.write(self.fd, data)
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
         try:
             os.kill(self.pid, 15)
         except ProcessLookupError:
@@ -70,7 +74,7 @@ class Bridge:
         self.listener.listen()
         self.listener.settimeout(0.2)
         self.stopped = False
-        self.thread = threading.Thread(target=self.serve)
+        self.thread = threading.Thread(target=self.serve, daemon=True)
         self.thread.start()
 
     def serve(self):
@@ -187,6 +191,60 @@ with open(sys.argv[1], 'ab', buffering=0) as f:
             until(lambda: len(two.requests) == 1)
             assert len(one.requests) == first_count + 1
             print("PASS: real tmux initial binding, active-client refusal, reconnect routes running proxy to the new bridge")
+            subprocess.run([str(wrapper), "detach-client", "-s", "coding"], env=env, check=True)
+            terminal.close()
+            # Create a session ourselves, with an intentionally stale environment.
+            command = shlex.join([BINARY, "proxy", "--", *agent_args])
+            subprocess.run([str(wrapper), "new-session", "-d", "-s", "passive", command], env=env, check=True)
+            terminal = Terminal([str(wrapper), "attach-session", "-t", "passive"], env)
+            terminal.ready()
+            before = len(two.requests)
+            terminal.send(b"\x16")
+            until(lambda: len(two.requests) == before + 1)
+            # Another ordinary tmux client must cause refusal, without stealing its binding.
+            other_env = dict(env, AGENTDROP_BRIDGE=one.endpoint)
+            other = Terminal([str(wrapper), "attach-session", "-t", "passive"], other_env)
+            try:
+                other.ready()
+                counts = (len(one.requests), len(two.requests))
+                length = len(output.read_bytes())
+                terminal.send(b"\x16")
+                until(lambda: len(output.read_bytes()) > length)
+                assert (len(one.requests), len(two.requests)) == counts
+            finally:
+                other.close()
+            until(lambda: subprocess.check_output([str(wrapper), "list-clients", "-t", "passive", "-F", "#{client_pid}"], env=env).count(b"\n") == 1)
+            terminal.send(b"\x16")
+            until(lambda: len(two.requests) == counts[1] + 1)
+            assert len(one.requests) == counts[0]
+            subprocess.run([str(wrapper), "detach-client", "-s", "passive"], env=env, check=True)
+            terminal.close()
+            terminal = Terminal([str(wrapper), "attach-session", "-t", "passive"], other_env)
+            terminal.ready()
+            terminal.send(b"\x16")
+            until(lambda: len(one.requests) == counts[0] + 1)
+            print("PASS: native tmux attach, stale pane environment, multiple-client refusal, remaining-client routing, native reconnect")
+            subprocess.run([str(wrapper), "detach-client", "-s", "passive"], env=env, check=True)
+            terminal.close()
+            # Install the opt-in zsh hook once. A preexisting function must still run,
+            # retaining literal arguments, without recursively wrapping the child shell.
+            zsh = __import__('shutil').which("zsh")
+            assert zsh, "zsh is required for shell integration testing"
+            local_binary = tools / "agentdrop"
+            local_binary.symlink_to(BINARY)
+            arguments = root / "arguments.txt"
+            (root / ".zshrc").write_text(
+                "function codex { print -rl -- \"$@\" > " + shlex.quote(str(arguments)) + "; "
+                + shlex.join(agent_args) + "; }\n"
+                + 'eval "$(agentdrop init zsh)"\n')
+            shell_env = dict(env, ZDOTDIR=str(root))
+            terminal = Terminal([zsh, "-lic", "codex 'two words' '$literal'"], shell_env)
+            terminal.ready()
+            assert arguments.read_text().splitlines() == ["two words", "$literal"]
+            before = len(two.requests)
+            terminal.send(b"\x16")
+            until(lambda: len(two.requests) == before + 1)
+            print("PASS: one-time zsh integration preserves existing function and literal arguments, with recursion guard")
         finally:
             subprocess.run([str(wrapper), "kill-server"], env=env, capture_output=True)
             terminal.close()
