@@ -8,7 +8,9 @@ v2 的目标是：**一次连接、一条启动命令，拖文件或按 Ctrl-V �
 
 ## 安装
 
-本机和远端都安装（从源码需要 Rust stable）：
+推荐从 [GitHub Releases](https://github.com/v0v0/alacritty-agent-drop/releases) 下载本机和远端对应架构的同一版本，校验并解压到 PATH，无需安装 Rust。发布规则、安装步骤见 [Release 文档](docs/releases.md)。
+
+从源码安装（需要 Rust stable）：
 
 ```sh
 cargo install --git https://github.com/v0v0/alacritty-agent-drop.git --branch v2 --locked --force
@@ -28,7 +30,7 @@ winget install tssh
 brew install trzsz-ssh
 ```
 
-也可以从本仓库 `ci` workflow 的 Artifacts 下载对应系统的二进制。Windows 为 `agentdrop.exe`；macOS 分 arm64 和 x86_64；Linux 为 x86_64。macOS 系统剪贴板需要在用户桌面会话中使用。
+尚未打版本 tag 时，可以从本仓库 `ci` workflow 的 Artifacts 下载对应系统的压缩包。Windows 为 `agentdrop.exe`；macOS 分 arm64 和 x86_64；Linux 为 x86_64。macOS 系统剪贴板需要在用户桌面会话中使用。
 
 ## 推荐：一条命令启动
 
@@ -159,5 +161,9 @@ python3 tests/e2e.py
 ```
 
 CI 对 Windows、macOS arm64、macOS x86_64 和 Ubuntu 运行单元测试并构建二进制；Ubuntu 额外运行真实 PTY / Unix socket / tmux 重连集成测试。真实 Alacritty 拖拽和系统剪贴板仍需在桌面环境手工验收，详见设计文档。
+
+## 发布与后续计划
+
+推送与 Cargo 版本一致的 `v*` tag 后，会测试、打包并自动创建 GitHub Release；`-rc` / `-beta` 等版本标记为 Pre-release。完整步骤见 [发布文档](docs/releases.md)，未完成的产品改进见 [后续计划](docs/roadmap.md)。
 
 MIT License.

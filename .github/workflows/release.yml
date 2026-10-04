@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Require tag to match Cargo.toml
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/release.py validate --tag "$RELEASE_TAG"
+
+  verify:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [validate, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify all four archives before publishing
+        run: python scripts/release.py checksums
+      - name: Create draft, upload assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        run: bash scripts/publish-release.sh
