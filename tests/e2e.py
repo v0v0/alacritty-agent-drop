@@ -236,6 +236,9 @@ with open(sys.argv[1], 'ab', buffering=0) as f:
             local_binary = tools / "agentdrop"
             local_binary.symlink_to(BINARY)
             arguments = root / "arguments.txt"
+            # Keep this fixture independent of runner-wide /etc/zsh completion setup.
+            # Local .zshrc still loads in both shells; production startup is unchanged.
+            (root / ".zshenv").write_text("unsetopt GLOBAL_RCS\n")
             (root / ".zshrc").write_text(
                 "function codex { print -rl -- \"$@\" > " + shlex.quote(str(arguments)) + "; "
                 + shlex.join(agent_args) + "; }\n"
