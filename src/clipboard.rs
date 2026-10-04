@@ -19,7 +19,7 @@ mod imp {
 
     use anyhow::{Context, Result, bail};
     use arboard::{Clipboard, Error as ClipboardError};
-    use image::{ColorType, ImageFormat};
+    use image::{ExtendedColorType, ImageEncoder};
     use uuid::Uuid;
 
     pub fn capture_image_to_temp() -> Result<Option<PathBuf>> {
@@ -49,23 +49,34 @@ mod imp {
 
         let width = u32::try_from(image.width).context("clipboard image width is too large")?;
         let height = u32::try_from(image.height).context("clipboard image height is too large")?;
-        let temp_dir = std::env::temp_dir().join("agentdrop").join("clipboard");
-        fs::create_dir_all(&temp_dir)
-            .with_context(|| format!("failed to create {}", temp_dir.display()))?;
-
-        let path = temp_dir.join(format!(
-            "clipboard-{}.png",
+        if expected_len as u64 > crate::protocol::MAX_FILE_SIZE {
+            bail!("clipboard image exceeds 256 MiB RGBA limit");
+        }
+        let path = std::env::temp_dir().join(format!(
+            "agentdrop-clipboard-{}.png",
             Uuid::new_v4().simple()
         ));
-        image::save_buffer_with_format(
-            &path,
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&path)
+            .context("failed to create private clipboard image")?;
+        let result = image::codecs::png::PngEncoder::new(&mut file).write_image(
             image.bytes.as_ref(),
             width,
             height,
-            ColorType::Rgba8,
-            ImageFormat::Png,
-        )
-        .with_context(|| format!("failed to encode clipboard image to {}", path.display()))?;
+            ExtendedColorType::Rgba8,
+        );
+        drop(file);
+        if let Err(error) = result {
+            let _ = fs::remove_file(&path);
+            return Err(error).context("failed to encode clipboard image");
+        }
 
         Ok(Some(path))
     }

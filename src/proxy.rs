@@ -1,24 +1,18 @@
 use std::ffi::OsString;
-use std::path::PathBuf;
 
 use anyhow::Result;
 
-pub fn run(command: Vec<OsString>, bridge_socket: Option<PathBuf>, zsh: bool) -> Result<i32> {
+pub fn run(command: Vec<OsString>, bridge_socket: Option<String>, zsh: bool) -> Result<i32> {
     imp::run(command, bridge_socket, zsh)
 }
 
 #[cfg(not(unix))]
 mod imp {
     use std::ffi::OsString;
-    use std::path::PathBuf;
 
     use anyhow::{Result, bail};
 
-    pub fn run(
-        _command: Vec<OsString>,
-        _bridge_socket: Option<PathBuf>,
-        _zsh: bool,
-    ) -> Result<i32> {
+    pub fn run(_command: Vec<OsString>, _bridge_socket: Option<String>, _zsh: bool) -> Result<i32> {
         bail!("agentdrop proxy is intended to run on the remote Unix/Linux host")
     }
 }
@@ -27,10 +21,9 @@ mod imp {
 mod imp {
     use std::ffi::OsString;
     use std::fs;
-    use std::io::{self, BufRead, BufReader, Read, Write};
-    use std::os::unix::fs::FileTypeExt;
+    use std::io::{self, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
-    use std::path::{Component, Path, PathBuf};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, RecvTimeoutError};
@@ -43,8 +36,9 @@ mod imp {
 
     use crate::paste::{BracketedPasteParser, InputEvent, write_bracketed_paste};
     use crate::protocol::{
-        BridgeRequest, BridgeResponse, BridgeStatus, PROTOCOL_VERSION,
+        self, BridgeRequest, BridgeResponse, Operation, Outcome, PROTOCOL_VERSION,
     };
+    use crate::session::{current_endpoint, shell_quote};
 
     const AMBIGUOUS_ESCAPE_TIMEOUT: Duration = Duration::from_millis(40);
     const CTRL_V: u8 = 0x16;
@@ -66,99 +60,62 @@ mod imp {
 
     #[derive(Debug)]
     struct LocalPathPaste {
-        path: String,
+        paths: Vec<String>,
         trailing_space: bool,
     }
 
     struct BridgeClient {
-        explicit_socket: Option<PathBuf>,
-        cached_socket: Option<PathBuf>,
+        explicit_endpoint: Option<String>,
     }
 
     impl BridgeClient {
-        fn new(explicit_socket: Option<PathBuf>) -> Self {
-            Self {
-                explicit_socket,
-                cached_socket: None,
-            }
+        fn new(explicit_endpoint: Option<String>) -> Self {
+            Self { explicit_endpoint }
         }
 
         fn upload(&mut self, local_path: &str) -> Result<PathBuf> {
-            let response = self.request(&BridgeRequest::upload_path(local_path))?;
-            if response.status != BridgeStatus::Success {
-                bail!("upload bridge returned unexpected status: {:?}", response.status);
-            }
-            let relative = response
-                .remote_relative_path
-                .context("upload bridge returned no remote path")?;
-            resolve_remote_path(&relative)
+            self.request(Operation::UploadPath {
+                path: local_path.into(),
+            })?
+            .context("bridge returned no file")
         }
 
         fn clipboard_image(&mut self) -> Result<Option<PathBuf>> {
-            let response = self.request(&BridgeRequest::clipboard_image())?;
-            match response.status {
-                BridgeStatus::Success => {
-                    let relative = response
-                        .remote_relative_path
-                        .context("clipboard bridge returned no remote path")?;
-                    Ok(Some(resolve_remote_path(&relative)?))
-                }
-                BridgeStatus::NoClipboardImage => Ok(None),
-                BridgeStatus::Error => bail!(
-                    "clipboard bridge error: {}",
-                    response.error.unwrap_or_else(|| "unknown error".to_owned())
-                ),
-            }
+            self.request(Operation::ClipboardImage)
         }
 
-        fn request(&mut self, request: &BridgeRequest) -> Result<BridgeResponse> {
-            let candidates = self.candidates()?;
-            if candidates.is_empty() {
-                bail!("no agentdrop bridge socket found; connect with `agentdrop connect <host>`")
+        fn request(&self, operation: Operation) -> Result<Option<PathBuf>> {
+            let endpoint = current_endpoint(self.explicit_endpoint.as_deref())?;
+            let mut stream = UnixStream::connect(&endpoint.socket)
+                .context("bridge disconnected; reconnect with agentdrop")?;
+            stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+            protocol::write_json(&mut stream, &BridgeRequest::new(endpoint.token, operation))?;
+            let mut reader = BufReader::new(stream);
+            let response: BridgeResponse = protocol::read_json(&mut reader)?;
+            if response.version != PROTOCOL_VERSION {
+                bail!("protocol mismatch; install the same v2 version on both hosts");
             }
-
-            let mut last_error = None;
-            for socket in candidates {
-                match request_bridge(&socket, request) {
-                    Ok(response) => {
-                        if response.status == BridgeStatus::Error {
-                            last_error = Some(anyhow::anyhow!(
-                                "{}",
-                                response.error.unwrap_or_else(|| "bridge request failed".to_owned())
-                            ));
-                            continue;
-                        }
-                        self.cached_socket = Some(socket);
-                        return Ok(response);
-                    }
-                    Err(error) => last_error = Some(error),
+            match response.outcome {
+                Outcome::NoClipboardImage => Ok(None),
+                Outcome::Error { message } => bail!("{message}"),
+                Outcome::File { name, size } => {
+                    let home = std::env::var_os("HOME").context("HOME is not set")?;
+                    let cache = PathBuf::from(home).join(".cache");
+                    fs::create_dir_all(&cache)?;
+                    let base = cache.join("agentdrop");
+                    Ok(Some(crate::transfer::receive(
+                        &mut reader,
+                        &base,
+                        &name,
+                        size,
+                    )?))
                 }
             }
-
-            Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no usable agentdrop bridge socket")))
-        }
-
-        fn candidates(&self) -> Result<Vec<PathBuf>> {
-            let mut candidates = Vec::new();
-            if let Some(path) = &self.explicit_socket {
-                candidates.push(path.clone());
-            } else if let Some(path) = std::env::var_os("AGENTDROP_BRIDGE_SOCKET") {
-                candidates.push(PathBuf::from(path));
-            } else {
-                if let Some(path) = &self.cached_socket {
-                    candidates.push(path.clone());
-                }
-                for path in discover_bridge_sockets()? {
-                    if !candidates.contains(&path) {
-                        candidates.push(path);
-                    }
-                }
-            }
-            Ok(candidates)
         }
     }
 
-    pub fn run(command: Vec<OsString>, bridge_socket: Option<PathBuf>, zsh: bool) -> Result<i32> {
+    pub fn run(command: Vec<OsString>, bridge_socket: Option<String>, zsh: bool) -> Result<i32> {
         if command.is_empty() {
             bail!("proxy requires a command, for example: agentdrop proxy -- codex")
         }
@@ -251,7 +208,10 @@ mod imp {
         argv
     }
 
-    fn copy_interactive_output<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
+    fn copy_interactive_output<R: Read, W: Write>(
+        reader: &mut R,
+        writer: &mut W,
+    ) -> io::Result<()> {
         let mut buffer = [0_u8; 8192];
         loop {
             let read = reader.read(&mut buffer)?;
@@ -265,7 +225,7 @@ mod imp {
 
     fn spawn_input_proxy(mut child_input: Box<dyn Write + Send>, mut bridge: BridgeClient) {
         thread::spawn(move || {
-            let (sender, receiver) = mpsc::channel::<Option<Vec<u8>>>();
+            let (sender, receiver) = mpsc::sync_channel::<Option<Vec<u8>>>(64);
 
             // Keep the blocking terminal read in a dedicated thread. The parser thread can then
             // time out an ambiguous `ESC` / `ESC[` prefix without making stdin non-blocking or
@@ -297,22 +257,14 @@ mod imp {
             loop {
                 match receiver.recv_timeout(AMBIGUOUS_ESCAPE_TIMEOUT) {
                     Ok(Some(bytes)) => {
-                        if forward_events(
-                            &mut child_input,
-                            &mut bridge,
-                            parser.feed(&bytes),
-                        )
-                        .is_err()
+                        if forward_events(&mut child_input, &mut bridge, parser.feed(&bytes))
+                            .is_err()
                         {
                             return;
                         }
                     }
                     Ok(None) | Err(RecvTimeoutError::Disconnected) => {
-                        let _ = forward_events(
-                            &mut child_input,
-                            &mut bridge,
-                            parser.finish(),
-                        );
+                        let _ = forward_events(&mut child_input, &mut bridge, parser.finish());
                         return;
                     }
                     Err(RecvTimeoutError::Timeout) => {
@@ -349,14 +301,33 @@ mod imp {
     ) -> io::Result<()> {
         match event {
             InputEvent::Bytes(bytes) => forward_raw_bytes(writer, bridge, &bytes),
+            InputEvent::Literal(bytes) => {
+                writer.write_all(&bytes)?;
+                writer.flush()
+            }
             InputEvent::Paste(payload) => {
                 let Some(local_file) = local_path_from_paste(&payload) else {
                     return write_bracketed_paste(writer, &payload);
                 };
 
-                match bridge.upload(&local_file.path) {
-                    Ok(remote_path) => {
-                        let mut replacement = remote_path.to_string_lossy().into_owned();
+                let uploaded = local_file
+                    .paths
+                    .iter()
+                    .map(|path| {
+                        if !crate::paths::is_windows(path) && Path::new(path).exists() {
+                            Ok(PathBuf::from(path))
+                        } else {
+                            bridge.upload(path)
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>();
+                match uploaded {
+                    Ok(remote_paths) => {
+                        let mut replacement = remote_paths
+                            .iter()
+                            .map(|p| shell_quote(&p.to_string_lossy()))
+                            .collect::<Vec<_>>()
+                            .join(" ");
                         if local_file.trailing_space {
                             replacement.push(' ');
                         }
@@ -389,7 +360,7 @@ mod imp {
 
             match bridge.clipboard_image() {
                 Ok(Some(remote_path)) => {
-                    let replacement = format!("{} ", remote_path.to_string_lossy());
+                    let replacement = format!("{} ", shell_quote(&remote_path.to_string_lossy()));
                     write_bracketed_paste(writer, replacement.as_bytes())?;
                 }
                 Ok(None) => {
@@ -416,133 +387,23 @@ mod imp {
     }
 
     fn show_bridge_error(context: &str, error: &anyhow::Error) {
-        let _ = io::stderr().write_all(
-            format!("\r\n[agentdrop] {context}: {error:#}\r\n").as_bytes(),
-        );
+        let _ =
+            io::stderr().write_all(format!("\r\n[agentdrop] {context}: {error:#}\r\n").as_bytes());
         let _ = io::stderr().flush();
     }
 
     fn local_path_from_paste(payload: &[u8]) -> Option<LocalPathPaste> {
-        let text = std::str::from_utf8(payload).ok()?;
-        let text = text.trim_end_matches(['\r', '\n']);
-        if text.is_empty() || text.contains('\r') || text.contains('\n') {
+        let (paths, trailing_space) = crate::paths::parse(payload)?;
+        if paths
+            .iter()
+            .all(|p| !crate::paths::is_windows(p) && Path::new(p).exists())
+        {
             return None;
         }
-
-        // Alacritty appends one separator space after a dropped file path.
-        let (text, trailing_space) = match text.strip_suffix(' ') {
-            Some(path) => (path, true),
-            None => (text, false),
-        };
-        let text = strip_matching_quotes(text);
-        if text.is_empty() {
-            return None;
-        }
-
-        let windows_absolute = is_windows_absolute_path(text);
-        let unix_absolute = text.starts_with('/');
-        if !windows_absolute && !unix_absolute {
-            return None;
-        }
-
-        // Existing remote Unix paths are normal Agent input, not local drops. A macOS/Linux
-        // local path is only bridged when that absolute path does not exist on the remote host.
-        if !windows_absolute && Path::new(text).exists() {
-            return None;
-        }
-
         Some(LocalPathPaste {
-            path: text.to_owned(),
+            paths,
             trailing_space,
         })
-    }
-
-    fn is_windows_absolute_path(value: &str) -> bool {
-        let bytes = value.as_bytes();
-        let drive = bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && matches!(bytes[2], b'\\' | b'/');
-        let unc = value.starts_with("\\\\");
-        drive || unc
-    }
-
-    fn strip_matching_quotes(value: &str) -> &str {
-        if value.len() >= 2 {
-            let first = value.as_bytes()[0];
-            let last = value.as_bytes()[value.len() - 1];
-            if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-                return &value[1..value.len() - 1];
-            }
-        }
-        value
-    }
-
-    fn discover_bridge_sockets() -> Result<Vec<PathBuf>> {
-        let mut candidates = Vec::new();
-        for entry in fs::read_dir("/tmp").context("failed to scan /tmp for agentdrop bridge")? {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
-            };
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if !name.starts_with("agentdrop-") || !name.ends_with(".sock") {
-                continue;
-            }
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
-            };
-            if !metadata.file_type().is_socket() {
-                continue;
-            }
-            let modified = metadata.modified().ok();
-            candidates.push((modified, entry.path()));
-        }
-        candidates.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(candidates.into_iter().map(|(_, path)| path).collect())
-    }
-
-    fn request_bridge(socket: &Path, request: &BridgeRequest) -> Result<BridgeResponse> {
-        let mut stream = UnixStream::connect(socket)
-            .with_context(|| format!("failed to connect bridge {}", socket.display()))?;
-        stream.set_read_timeout(Some(Duration::from_secs(300)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-
-        serde_json::to_writer(&mut stream, request)?;
-        stream.write_all(b"\n")?;
-        stream.flush()?;
-
-        let mut line = String::new();
-        let mut reader = BufReader::new(stream);
-        if reader.read_line(&mut line)? == 0 {
-            bail!("upload bridge closed without a response");
-        }
-        let response: BridgeResponse = serde_json::from_str(line.trim_end())?;
-        if response.version != PROTOCOL_VERSION {
-            bail!(
-                "upload bridge protocol mismatch: remote={}, local={PROTOCOL_VERSION}",
-                response.version
-            );
-        }
-        Ok(response)
-    }
-
-    fn resolve_remote_path(relative: &str) -> Result<PathBuf> {
-        let relative = Path::new(relative);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| matches!(component, Component::ParentDir))
-        {
-            bail!("bridge returned unsafe relative path: {}", relative.display());
-        }
-        let home = std::env::var_os("HOME").context("HOME is not set on remote host")?;
-        let path = PathBuf::from(home).join(relative);
-        Ok(path.canonicalize().unwrap_or(path))
     }
 
     #[cfg(test)]
@@ -579,17 +440,17 @@ mod imp {
 
         #[test]
         fn recognizes_windows_drive_and_unc_paths() {
-            assert!(is_windows_absolute_path(r"C:\Users\me\shot.png"));
-            assert!(is_windows_absolute_path("D:/images/shot.png"));
-            assert!(is_windows_absolute_path(r"\\server\share\shot.png"));
-            assert!(!is_windows_absolute_path("relative\\shot.png"));
+            assert!(crate::paths::is_windows(r"C:\Users\me\shot.png"));
+            assert!(crate::paths::is_windows("D:/images/shot.png"));
+            assert!(crate::paths::is_windows(r"\\server\share\shot.png"));
+            assert!(!crate::paths::is_windows("relative\\shot.png"));
         }
 
         #[test]
         fn recognizes_windows_drop_without_remote_filesystem_lookup() {
             let paste = local_path_from_paste(b"C:\\Users\\me\\shot.png ")
                 .expect("Windows drop should be treated as a local path");
-            assert_eq!(paste.path, r"C:\Users\me\shot.png");
+            assert_eq!(paste.paths, [r"C:\Users\me\shot.png"]);
             assert!(paste.trailing_space);
         }
 
@@ -626,7 +487,8 @@ mod imp {
             let bytes = b"abc\x01\x05\x12\x1b[A";
             assert!(!bytes.contains(&CTRL_V));
             let mut writer = RecordingWriter::default();
-            writer.write_all(bytes).expect("write fixture");
+            forward_raw_bytes(&mut writer, &mut BridgeClient::new(None), bytes)
+                .expect("forward keys");
             assert_eq!(writer.0, bytes);
         }
     }

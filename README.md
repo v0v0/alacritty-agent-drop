@@ -1,382 +1,163 @@
-# alacritty-agent-drop
+# alacritty-agent-drop · v2
 
-让 **Windows Explorer / macOS Finder → Alacritty → tssh → Ubuntu/tmux → Codex / Claude 等 Agent CLI** 支持类似 Wave 的本地文件拖拽与截图粘贴体验。
+把本机文件和截图送进远端 Codex / Claude Code 输入框。支持 **Windows / macOS → Alacritty → tssh → Linux → tmux → Agent**。
 
-支持两类输入：
+v2 的目标是：**一次连接、一条启动命令，拖文件或按 Ctrl-V 即可。** 文件通过已有 SSH 的转发通道直接流式传输，无需 `trz`，无需第二次 SSH 认证。本机终端输入继续由 SSH 客户端原生处理。
 
-```text
-文件拖拽：Explorer / Finder → remote file path → Agent
-截图粘贴：Win+Shift+S / macOS screenshot → clipboard image → Ctrl-V → remote PNG path → Agent
-```
-
-## 架构
-
-`0.1.x` 曾把 `agentdrop` 放在 Alacritty 和 `tssh` 之间，透明代理整个本地 PTY：
-
-```text
-Alacritty → agentdrop PTY proxy → tssh → tmux → Agent
-```
-
-这种设计会让 `agentdrop` 参与 Windows Console / ConPTY、方向键、Ctrl-A/E/R、terminal raw mode 等所有交互协议，容易破坏正常终端行为。
-
-`0.2.x` 起改成两段式架构，`0.3.x` 在同一 side-channel 上增加 clipboard image：
-
-```text
-Windows / macOS                         Ubuntu remote
-
-Alacritty                               tmux
-   │                                      │
-   │ native terminal I/O                  ▼
-   ▼                                agentdrop proxy
-agentdrop connect                         │
-   │                                      ▼
-   └──── exec tssh directly ───────────► Codex / Claude
-   │
-   └─ local bridge
-          ▲
-          │ SSH RemoteForward (Unix socket, mode 0600)
-          └──────── file / clipboard ── agentdrop proxy
-```
-
-**本机 `agentdrop connect` 不读取、不解析、不重写 stdin/stdout。** 它只启动本地 bridge，然后以 inherited stdio 直接启动 `tssh`。方向键、Ctrl-A、Ctrl-E、Ctrl-R、tmux shortcut 等继续由 Alacritty + tssh 原生处理。
-
-只有远端 `agentdrop proxy` 包住 Agent CLI：
-
-- bracketed paste 中出现 Windows/macOS 本地文件路径时，请求本机上传；
-- 普通 raw input 中出现 `Ctrl-V` (`0x16`) 时，请求本机读取 clipboard image；
-- 上传完成后把 Ubuntu 绝对路径作为 bracketed paste 注入 Agent。
-
-## 要求
-
-### 本机 Windows / macOS
-
-- Alacritty
-- `tssh` / trzsz-ssh **0.1.23+**（需要 RemoteForward Unix socket 支持）
-- Rust stable（从源码安装时）
-
-Windows：
-
-```powershell
-winget install tssh
-```
-
-macOS：
-
-```zsh
-brew install trzsz-ssh
-```
-
-### 远端 Ubuntu / Linux
-
-- `trz` 可执行文件在 `PATH`
-- `agentdrop` 安装在远端
-- Agent CLI（Codex、Claude Code 等）
-
-确认：
-
-```zsh
-trz --version
-```
+> 本分支的软件版本为 `0.4.0`，线协议为 `3`。本机和远端需同时安装 v2，不能与 `main` 的 `0.3.x` 混用。设计评审与取舍见 [docs/v2-design.md](docs/v2-design.md)。
 
 ## 安装
 
-本机和远端都安装同一个 crate：
+本机和远端都安装（从源码需要 Rust stable）：
 
-```text
-cargo install --git https://github.com/v0v0/alacritty-agent-drop.git --force
+```sh
+cargo install --git https://github.com/v0v0/alacritty-agent-drop.git --branch v2 --locked --force
 ```
 
-本机使用 `connect` 模式，远端 Ubuntu 使用 `proxy` 模式。
+确保 `agentdrop` 在 PATH 中。远端默认还会查找 `~/.cargo/bin` 和 `~/.local/bin`。
 
-## 使用
-
-### 1. 本机连接远端
-
-原来：
-
-```text
-tssh dev
-```
-
-改成：
-
-```text
-agentdrop connect dev
-```
-
-额外 tssh 参数放在 `--` 后：
-
-```text
-agentdrop connect dev -- -A
-```
-
-自定义 tssh 路径：
+本机需要 Alacritty、tssh 0.1.23+（支持 Unix socket RemoteForward）；远端需要 Linux、Agent CLI。只有使用 `--tmux` 时才需要 tmux 3.2+。
 
 ```powershell
-agentdrop connect dev --tssh C:\Tools\tssh.exe
+# Windows
+winget install tssh
 ```
 
-```zsh
-agentdrop connect dev --tssh /opt/homebrew/bin/tssh
+```sh
+# macOS
+brew install trzsz-ssh
 ```
 
-`connect` 实际会给主 tssh 连接增加：
+也可以从本仓库 `ci` workflow 的 Artifacts 下载对应系统的二进制。Windows 为 `agentdrop.exe`；macOS 分 arm64 和 x86_64；Linux 为 x86_64。macOS 系统剪贴板需要在用户桌面会话中使用。
 
-```text
--o EnableDragFile=no
--o StreamLocalBindUnlink=yes
--o StreamLocalBindMask=0177
--R /tmp/agentdrop-<uuid>.sock:127.0.0.1:<local-random-port>
+## 推荐：一条命令启动
+
+```sh
+agentdrop run dev -- codex
+agentdrop run dev -- claude
 ```
 
-这里主动关闭 `tssh` 自带 `EnableDragFile`。tssh 的原生拖拽上传会在当前 pane 里发送 Ctrl-C 并运行 `trz`，会中断正在前台运行的 Agent TUI。
+`dev` 是你已有的 SSH Host 别名，原有密钥、跳板机和 SSH 配置继续使用。
 
-手工在 shell 中运行 `trz` / `tsz` 不受影响。
+需要断线后保留 Agent：
 
-### 2. 远端用 proxy 启动 Agent
+```sh
+agentdrop run dev --tmux coding -- codex
+```
 
-普通 PATH 二进制：
+断线或 `Ctrl-B D` 分离后，再执行**同一命令**重连。已有 Agent 进程会继续运行，粘贴通道切换到本次连接；已有 session 不会重新执行命令参数。不同任务或电脑使用不同名字，例如 `--tmux coding-mac`。
 
-```zsh
+已有 session 仍有客户端连接时，`agentdrop` 会拒绝接管；先分离旧客户端。如果网络断开但服务器尚未发现断线，需要等 SSH 断线检测或手工分离旧客户端。
+
+如果 `codex` / `claude` 是 `.zshrc` 中的 function：
+
+```sh
+agentdrop run dev --tmux coding --zsh -- codex
+```
+
+`--zsh` 在远端加载 `.zshrc`，通过 positional arguments 执行函数并保留参数，不拼接 `eval`。不保证 shell alias；请使用 function 或可执行文件。
+
+## 拖文件与截图
+
+- **拖文件**：从 Explorer / Finder 拖入 Agent 输入框。支持一次多个文件、中文、空格、Windows 盘符 / UNC、Finder 转义路径。文件完整保存到远端后，再注入带引号的绝对路径。
+- **粘贴截图**：Windows `Win+Shift+S` 截图后，在 Agent 中按 **Ctrl-V**。macOS 把截图复制到剪贴板后也按 **Ctrl-V**。
+- **粘贴普通文字**：保留 Alacritty 原来的快捷键，Windows 通常为 `Ctrl+Shift+V`，macOS 为 `Cmd-V`。文本里的 Ctrl-V 字节不会触发取图。
+- 本机没有剪贴板图片时，原始 Ctrl-V 交给 Agent。
+- 上传失败时显示错误，原始粘贴内容交给 Agent；不会把尚未写完的远端文件路径交给 Agent。
+
+确保 Alacritty 的 Ctrl-V 向终端发送 `0x16`，而不是被自定义映射成 Paste。若有冲突，在现有 `alacritty.toml` 的键绑定数组中合并：
+
+```toml
+[[keyboard.bindings]]
+key = "V"
+mods = "Control"
+chars = "\u0016"
+```
+
+文件拖拽仍要求 Agent 开启 bracketed paste。目录不上传。已经存在于远端的 Unix 路径按远端文件处理；本机和远端同名绝对路径冲突时，优先远端路径。
+
+## 保留先连接、再启动的方式
+
+```sh
+agentdrop connect dev
+# 进入远端后：
 agentdrop proxy -- codex
-agentdrop proxy -- claude
-```
-
-如果 `codex` / `claude` 本身是 `~/.zshrc` 中的 **zsh function**，例如用于注入代理、API key 或其他环境变量：
-
-```zsh
-agentdrop proxy --zsh -- codex
+# 或：
 agentdrop proxy --zsh -- claude
 ```
 
-`--zsh` 会在 Agent PTY 内启动：
+需要 tmux 时推荐直接从本机使用 `run --tmux`。也可以在上述远端 shell 中使用：
+
+```sh
+agentdrop attach --session coding -- codex
+```
+
+不要依赖普通 `tmux attach` 自动更新桥接变量；由 `agentdrop attach` 管理绑定和重连。同一 tmux session 有多个客户端时，自动上传和取图会报错，不猜测来源。直接代理和不同 tmux session 相互独立。
+
+## 连接参数
+
+```sh
+# 自定义 SSH 客户端和远端二进制路径
+agentdrop run dev --tssh /opt/homebrew/bin/tssh --remote-bin /opt/bin/agentdrop -- codex
+
+# 额外 SSH 参数，必须与 Agent 参数区分
+agentdrop run dev --ssh-arg=-p --ssh-arg=2222 -- codex --model my-model
+
+# connect 仍支持旧的额外参数形式
+agentdrop connect dev -- -A
+
+# Unix 上也可使用支持 Unix socket 转发的 OpenSSH
+agentdrop run dev --tssh ssh -- codex
+```
+
+本项目管理 `-tt`、`-R`、`EnableDragFile`、`StreamLocalBindMask` 和远端启动命令。额外参数用于端口、身份文件、跳板机等；不要同时配置 `-N`、`-f`、`-T`、`RemoteCommand`、清除转发或另一条远端命令。
+
+## 分享范围
+
+默认允许请求本机已知绝对路径的普通文件和当前剪贴板图片。可以缩小范围：
+
+```powershell
+agentdrop run dev --allow-root C:\Users\me\Pictures --allow-root C:\work -- codex
+```
+
+```sh
+agentdrop run dev --allow-root "$HOME/Pictures" --no-clipboard -- codex
+```
+
+`--allow-root` 可重复，对路径先解析符号链接再检查；它限制文件拖拽，剪贴板由 `--no-clipboard` 单独控制。
+
+每次连接生成独立 socket 和随机 token，远端 socket 为 0600，本机 bridge 只监听 loopback。**远端同一 Unix 用户及本机可读取启动参数/环境的进程仍属于信任边界**，token 不能隔离它们。只向可信主机和账号开启分享。
+
+## 缓存与限制
+
+远端文件位于：
 
 ```text
-zsh -lic '"$@"' agentdrop-proxy <agent> <args...>
+~/.cache/agentdrop/files/<request-id>/<original-name>
 ```
 
-因此 `.zshrc` 会正常加载，原有 Agent function 和环境初始化仍然生效。参数使用 positional arguments，不通过字符串拼接或 `eval`。
+缓存目录 0700，文件 0600。先写临时文件，校验接收长度并落盘，最后重命名；异常时清理该请求目录。原文件名含路径分隔符或控制字符会被拒绝。
 
-> 这里保证 zsh **function** 和启动环境；alias 属于词法展开，不建议把 Agent 启动逻辑只放在 alias 里。
+- 单文件上限 256 MiB；单次粘贴最多识别 32 个路径。
+- 每个连接最多同时处理 8 个 bridge 请求；控制头上限 64 KiB。
+- 传输停顿超时 30 秒；等待期间输入按原顺序排队，有界队列避免无限增长。大文件传输期间按键可能延后，当前没有独立取消键。
+- 超过 8 MiB 的文本粘贴以原字节透传，不做文件识别或 Ctrl-V 解释。
+- 本机截图临时文件在请求结束时清理；进程被强制结束可能留下 `agentdrop-clipboard-*.png`。
+- 远端缓存不自动过期，避免长任务引用的附件突然消失。确认 Agent 不再使用后可手动删除旧请求目录。
+- Linux 本机不读取桌面剪贴板；仍可桥接本地普通文件。
+- 不提供本地 PTY 代理、目录递归上传、跨用户分享或多个客户端共同控制同一 Agent 的自动剪贴板路由。
 
-推荐保留原 function，增加独立入口：
+## 开发与验证
 
-```zsh
-codexd() {
-    agentdrop proxy --zsh -- codex "$@"
-}
-
-clauded() {
-    agentdrop proxy --zsh -- claude "$@"
-}
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-targets
+cargo build --locked
+# Linux，有 Python 3、tmux 和正常的 PTY/Unix socket 权限：
+python3 tests/e2e.py
 ```
 
-需要增强能力时运行：
+CI 对 Windows、macOS arm64、macOS x86_64 和 Ubuntu 运行单元测试并构建二进制；Ubuntu 额外运行真实 PTY / Unix socket / tmux 重连集成测试。真实 Alacritty 拖拽和系统剪贴板仍需在桌面环境手工验收，详见设计文档。
 
-```zsh
-codexd
-clauded
-```
-
-`agentdrop proxy` 可以直接运行在 tmux pane 内，不需要修改 tmux 配置。
-
-## 截图直接 Ctrl-V
-
-### Windows
-
-例如：
-
-```text
-Win+Shift+S
-    ↓
-框选截图，图片进入 Windows Clipboard
-    ↓
-回到 Alacritty 中正在运行的 remote Codex
-    ↓
-Ctrl-V
-```
-
-流程：
-
-```text
-1. Alacritty 把 Ctrl-V 作为 0x16 发给 tssh
-2. tssh / SSH / tmux 原样传到 Ubuntu
-3. agentdrop proxy 只在 Agent 边界识别 0x16
-4. proxy 通过 /tmp/agentdrop-*.sock 请求本机 clipboard image
-5. Windows agentdrop connect 使用系统 clipboard API 读取图片
-6. 图片编码为本机临时 PNG
-7. bridge 通过第二条 tssh --upload-file 上传 PNG
-8. 本机临时 PNG 删除
-9. Ubuntu 得到：
-   $HOME/.cache/agentdrop/files/<session>/<request>/clipboard-<uuid>.png
-10. proxy 把该 Ubuntu 绝对路径作为 bracketed paste 注入 Codex
-```
-
-最终 Codex 接收到的是远端真实存在的图片路径，而不是 Windows bitmap 或本机路径。
-
-如果本机 clipboard **没有图片**，`agentdrop proxy` 不会吞掉 Ctrl-V，而是把原始 `0x16` 转发给 Agent。
-
-### macOS
-
-本地 bridge 同样支持 macOS system clipboard image。触发协议当前仍然是远端 Agent 收到的 `Ctrl-V` (`0x16`)；macOS 常规文本粘贴继续使用 `Cmd-V`，不会经过这条 clipboard-image trigger。
-
-## 普通文本粘贴
-
-截图粘贴不会改变 Alacritty 原本的文本粘贴链路。
-
-Windows 常规文本 paste 通常仍使用：
-
-```text
-Ctrl+Shift+V
-```
-
-它会进入 bracketed paste，并直接传给 Agent；其中即使文本里包含普通字符，也不会触发 clipboard-image 请求。
-
-## 文件拖拽
-
-例如 Codex 正在前台，从 Windows Explorer 拖：
-
-```text
-C:\Users\me\Desktop\shot.png
-```
-
-流程：
-
-```text
-1. Alacritty 把本地路径作为 bracketed paste 发送
-2. tssh 原样透传，不做 drag upload
-3. Ubuntu 上的 agentdrop proxy 看到 C:\... 本地路径
-4. proxy 连接 /tmp/agentdrop-*.sock
-5. SSH RemoteForward 把请求转回本机 agentdrop bridge
-6. 本机 bridge 验证文件真实存在
-7. bridge 另开一条 tssh --upload-file 连接上传
-8. 保存到：
-   $HOME/.cache/agentdrop/files/<session>/<request>/shot.png
-9. proxy 收到相对路径，在 Ubuntu 解析成绝对路径
-10. Codex 输入框收到 remote absolute path
-```
-
-macOS Finder 的 `/Users/...` 路径采用同一机制。如果一个 Unix 绝对路径本身已经存在于远端，proxy 会认为它是正常远端路径，不触发上传。
-
-## 为什么键盘行为不再被本机 agentdrop 破坏
-
-`connect` 使用标准 `std::process::Command`：
-
-```text
-stdin  = inherit
-stdout = inherit
-stderr = inherit
-```
-
-因此：
-
-```text
-Alacritty keyboard event
-        ↓
-tssh 自己的 Windows/macOS terminal implementation
-        ↓
-SSH
-        ↓
-tmux
-```
-
-本机 `agentdrop` 不调用 `enable_raw_mode()`，不创建 ConPTY/portable-pty，也不解析 `ESC[A`、Ctrl-A/E/R 等输入。
-
-远端 proxy 需要一个 Unix PTY，因为 Codex/Claude 是 TUI。它只包住 Agent 进程，并且只对两类输入增强：bracketed-pasted 本地路径和单独的 Ctrl-V clipboard-image trigger。
-
-## bridge socket 发现
-
-默认情况下，远端 proxy 扫描：
-
-```text
-/tmp/agentdrop-*.sock
-```
-
-并优先尝试最新且可连接的 socket。
-
-同一远端账号同时开多条 `agentdrop connect` 时可显式指定：
-
-```zsh
-agentdrop proxy --bridge-socket /tmp/agentdrop-<uuid>.sock -- codex
-```
-
-或：
-
-```zsh
-export AGENTDROP_BRIDGE_SOCKET=/tmp/agentdrop-<uuid>.sock
-```
-
-## 安全边界
-
-RemoteForward socket 使用：
-
-```text
-StreamLocalBindMask=0177
-```
-
-因此远端 socket 只允许当前 Unix 用户访问（0600）。
-
-但必须注意：**与 Agent 同一个远端 Unix 账号运行的其他进程属于同一信任边界。** 能连接该 socket 的进程可以：
-
-- 请求上传一个它知道绝对路径的本机普通文件；
-- 请求读取并上传当前本机 clipboard image。
-
-因此不要在不可信的远端账号、共享账号或同一账号运行不可信代码的环境中启用此 bridge。
-
-bridge 不提供任意本机文件枚举；文件上传仍要求请求方知道具体绝对路径。clipboard 请求只读取 image format，不读取 clipboard text。
-
-## side-channel 上传认证
-
-上传使用第二条短连接：
-
-```text
-tssh --upload-file <local-file> dev 'trz ...'
-```
-
-推荐使用 SSH key、ssh-agent、Pageant 或 tssh 已保存的认证信息。否则每次拖文件/粘贴截图都可能需要再次认证。
-
-## 临时文件与远端缓存
-
-clipboard image 会先写入本机系统 temp 下的：
-
-```text
-agentdrop/clipboard/clipboard-<uuid>.png
-```
-
-上传结束后立即删除该本机临时文件。
-
-远端文件保存在：
-
-```text
-$HOME/.cache/agentdrop/files/<session>/<request>/
-```
-
-远端缓存当前不自动删除，可以周期清理：
-
-```zsh
-find ~/.cache/agentdrop/files -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf -- {} +
-```
-
-## 当前限制
-
-- 自动桥接普通文件，不上传目录。
-- clipboard image 在 Windows/macOS 本机支持；Linux `connect` 不读取桌面 clipboard。
-- 截图粘贴 trigger 当前固定为 `Ctrl-V` (`0x16`)。
-- 文件拖拽依赖 Agent/TUI 开启 bracketed paste。
-- 本地文件名需要能够表示为 UTF-8。
-- side-channel 需要能独立完成 SSH 认证。
-- 同一远端 Unix 用户被视为信任边界。
-- `proxy` 模式面向 Unix/Linux 远端；Windows/macOS 是主要 `connect` 客户端平台。
-
-## 开发
-
-```text
-cargo test --all-targets
-cargo build --release
-```
-
-CI 验证 Windows、macOS Apple Silicon、macOS Intel 和 Ubuntu，并构建 Windows/macOS/Linux release artifact。
-
-## License
-
-MIT
+MIT License.

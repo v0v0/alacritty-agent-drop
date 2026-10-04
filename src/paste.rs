@@ -1,3 +1,5 @@
+const MAX_PASTE: usize = 8 * 1024 * 1024;
+
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -5,12 +7,15 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 pub enum InputEvent {
     Bytes(Vec<u8>),
     Paste(Vec<u8>),
+    /// An oversized/unfinished paste, forwarded without interpreting control bytes.
+    Literal(Vec<u8>),
 }
 
 #[derive(Default)]
 pub struct BracketedPasteParser {
     buffer: Vec<u8>,
     in_paste: bool,
+    passthrough: bool,
 }
 
 impl BracketedPasteParser {
@@ -21,8 +26,31 @@ impl BracketedPasteParser {
         loop {
             if self.in_paste {
                 let Some(end) = find_subslice(&self.buffer, PASTE_END) else {
+                    if self.buffer.len() > MAX_PASTE || self.passthrough {
+                        let keep = longest_suffix_prefix(&self.buffer, PASTE_END);
+                        let mut literal = Vec::new();
+                        if !self.passthrough {
+                            literal.extend_from_slice(PASTE_START);
+                        }
+                        literal.extend(self.buffer.drain(..self.buffer.len() - keep));
+                        self.passthrough = true;
+                        if !literal.is_empty() {
+                            events.push(InputEvent::Literal(literal));
+                        }
+                    }
                     break;
                 };
+                if self.passthrough || end > MAX_PASTE {
+                    let mut literal = Vec::new();
+                    if !self.passthrough {
+                        literal.extend_from_slice(PASTE_START);
+                    }
+                    literal.extend(self.buffer.drain(..end + PASTE_END.len()));
+                    self.in_paste = false;
+                    self.passthrough = false;
+                    events.push(InputEvent::Literal(literal));
+                    continue;
+                }
 
                 let payload = self.buffer[..end].to_vec();
                 self.buffer.drain(..end + PASTE_END.len());
@@ -69,17 +97,25 @@ impl BracketedPasteParser {
         }
 
         let mut bytes = Vec::new();
-        if self.in_paste {
+        if self.in_paste && !self.passthrough {
             bytes.extend_from_slice(PASTE_START);
         }
         bytes.append(&mut self.buffer);
+        let literal = self.in_paste;
         self.in_paste = false;
-
-        vec![InputEvent::Bytes(bytes)]
+        self.passthrough = false;
+        if literal {
+            vec![InputEvent::Literal(bytes)]
+        } else {
+            vec![InputEvent::Bytes(bytes)]
+        }
     }
 }
 
-pub fn write_bracketed_paste<W: std::io::Write>(writer: &mut W, payload: &[u8]) -> std::io::Result<()> {
+pub fn write_bracketed_paste<W: std::io::Write>(
+    writer: &mut W,
+    payload: &[u8],
+) -> std::io::Result<()> {
     writer.write_all(PASTE_START)?;
     writer.write_all(payload)?;
     writer.write_all(PASTE_END)?;
@@ -90,7 +126,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
     }
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn longest_suffix_prefix(bytes: &[u8], prefix: &[u8]) -> usize {
@@ -104,6 +142,27 @@ fn longest_suffix_prefix(bytes: &[u8], prefix: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_paste_is_bounded_and_never_interpreted_as_keys() {
+        let mut parser = BracketedPasteParser::default();
+        assert!(parser.feed(PASTE_START).is_empty());
+        let bytes = vec![0x16; MAX_PASTE + 1];
+        let events = parser.feed(&bytes);
+        let [InputEvent::Literal(literal)] = events.as_slice() else {
+            panic!("expected literal passthrough")
+        };
+        assert_eq!(&literal[..PASTE_START.len()], PASTE_START);
+        assert_eq!(&literal[PASTE_START.len()..], bytes);
+        assert!(parser.buffer.len() < PASTE_END.len());
+        assert_eq!(
+            parser.feed(b"tail\x1b[201~x"),
+            vec![
+                InputEvent::Literal(b"tail\x1b[201~".to_vec()),
+                InputEvent::Bytes(b"x".to_vec())
+            ]
+        );
+    }
 
     #[test]
     fn forwards_normal_input() {
@@ -149,7 +208,7 @@ mod tests {
 
     #[test]
     fn forwards_arrow_sequences_once_they_diverge_from_paste_prefix() {
-        for arrow in [b'A', b'B', b'C', b'D'] {
+        for arrow in *b"ABCD" {
             let mut parser = BracketedPasteParser::default();
             assert!(parser.feed(b"\x1b").is_empty());
             assert!(parser.feed(b"[").is_empty());
@@ -163,7 +222,10 @@ mod tests {
     #[test]
     fn parses_paste_across_chunks() {
         let mut parser = BracketedPasteParser::default();
-        assert_eq!(parser.feed(b"abc\x1b[20"), vec![InputEvent::Bytes(b"abc".to_vec())]);
+        assert_eq!(
+            parser.feed(b"abc\x1b[20"),
+            vec![InputEvent::Bytes(b"abc".to_vec())]
+        );
         assert!(parser.feed(b"0~C:\\Users\\me\\shot").is_empty());
         assert_eq!(
             parser.feed(b".png\x1b[201~xyz"),
@@ -180,7 +242,7 @@ mod tests {
         assert!(parser.feed(b"\x1b[200~unfinished").is_empty());
         assert_eq!(
             parser.finish(),
-            vec![InputEvent::Bytes(b"\x1b[200~unfinished".to_vec())]
+            vec![InputEvent::Literal(b"\x1b[200~unfinished".to_vec())]
         );
     }
 }

@@ -1,81 +1,184 @@
 mod clipboard;
 mod connect;
 mod paste;
+mod paths;
 mod protocol;
 mod proxy;
-
-use std::ffi::OsString;
-use std::path::PathBuf;
+mod session;
+mod transfer;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use std::ffi::OsString;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "agentdrop",
     version,
-    about = "Bridge local file drops and clipboard images into remote Agent CLIs without proxying the SSH terminal input"
+    about = "Drop local files and paste screenshots into remote Agents over one SSH connection"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
+#[derive(Debug, Args)]
+struct Connection {
+    /// SSH host alias or user@host
+    destination: String,
+    /// Local SSH executable (tssh recommended on Windows)
+    #[arg(long, default_value = "tssh")]
+    tssh: OsString,
+    /// Extra SSH argument; repeat, e.g. --ssh-arg=-p --ssh-arg=2222
+    #[arg(long = "ssh-arg", allow_hyphen_values = true)]
+    ssh_args: Vec<OsString>,
+    /// Restrict local file sharing to this directory (repeatable; symlinks resolved)
+    #[arg(long)]
+    allow_root: Vec<PathBuf>,
+    /// Disable sharing local clipboard images
+    #[arg(long)]
+    no_clipboard: bool,
+    /// Remote agentdrop executable
+    #[arg(long, default_value = "agentdrop")]
+    remote_bin: String,
+}
+impl Connection {
+    fn options(self) -> connect::Options {
+        connect::Options {
+            tssh: self.tssh,
+            destination: self.destination,
+            tssh_args: self.ssh_args,
+            allow_roots: self.allow_root,
+            clipboard: !self.no_clipboard,
+            remote_bin: self.remote_bin,
+            command: Vec::new(),
+            zsh: false,
+            tmux: None,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Connect to a remote host with native tssh I/O plus a private upload side-channel.
+    /// Open a remote login shell with a bound bridge
     Connect {
-        /// tssh destination, e.g. dev or user@example.com
-        destination: String,
-
-        /// Path or command name of the local tssh executable
-        #[arg(long, default_value = "tssh")]
-        tssh: OsString,
-
-        /// Extra tssh options. Put them after `--`; they are inserted before the destination.
+        #[command(flatten)]
+        connection: Connection,
+        /// Extra tssh options (legacy syntax)
         #[arg(last = true, allow_hyphen_values = true)]
         tssh_args: Vec<OsString>,
     },
-
-    /// Run on the remote Unix host and wrap only the Agent CLI process.
-    Proxy {
-        /// Explicit reverse-forwarded Unix socket. Normally auto-discovered from /tmp.
+    /// Connect and launch an Agent in one command
+    Run {
+        #[command(flatten)]
+        connection: Connection,
+        /// Create or reconnect a dedicated tmux session
         #[arg(long)]
-        bridge_socket: Option<PathBuf>,
-
-        /// Start through `zsh -lic`, preserving .zshrc functions and environment setup.
+        tmux: Option<String>,
+        /// Load remote .zshrc functions before running the Agent
         #[arg(long)]
         zsh: bool,
-
-        /// Agent command and arguments, for example: `codex` or `claude`.
+        #[arg(required = true, last = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
+    /// Wrap an Agent on the remote Unix host
+    Proxy {
+        /// Explicit socket:token binding; normally inherited from the connection
+        #[arg(long)]
+        bridge: Option<String>,
+        #[arg(long)]
+        zsh: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
+    /// Bind and attach a dedicated tmux session (invoked by run --tmux)
+    Attach {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        zsh: bool,
+        #[arg(required = true, last = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
 }
 
 fn main() {
-    let exit_code = match run() {
+    let code = match run() {
         Ok(code) => code,
         Err(error) => {
             eprintln!("agentdrop: {error:#}");
             1
         }
     };
-    std::process::exit(exit_code);
+    std::process::exit(code);
 }
-
 fn run() -> Result<i32> {
-    let cli = Cli::parse();
-    match cli.command {
+    match Cli::parse().command {
         Command::Connect {
-            destination,
-            tssh,
+            connection,
             tssh_args,
-        } => connect::run(tssh, destination, tssh_args),
-        Command::Proxy {
-            bridge_socket,
+        } => {
+            let mut options = connection.options();
+            options.tssh_args.extend(tssh_args);
+            connect::run(options)
+        }
+        Command::Run {
+            connection,
+            tmux,
             zsh,
             command,
-        } => proxy::run(command, bridge_socket, zsh),
+        } => {
+            let mut options = connection.options();
+            options.tmux = tmux;
+            options.zsh = zsh;
+            options.command = command;
+            connect::run(options)
+        }
+        Command::Proxy {
+            command,
+            bridge,
+            zsh,
+        } => proxy::run(command, bridge, zsh),
+        Command::Attach {
+            command,
+            session,
+            zsh,
+        } => session::attach(&session, command, zsh),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn run_preserves_agent_flags_and_ssh_options() {
+        let cli = Cli::try_parse_from([
+            "agentdrop",
+            "run",
+            "dev",
+            "--tmux",
+            "coding",
+            "--ssh-arg=-p",
+            "--ssh-arg=2222",
+            "--",
+            "codex",
+            "--model",
+            "x y",
+        ])
+        .unwrap();
+        let Command::Run {
+            connection,
+            command,
+            tmux,
+            ..
+        } = cli.command
+        else {
+            panic!()
+        };
+        assert_eq!(connection.ssh_args, ["-p", "2222"]);
+        assert_eq!(command, ["codex", "--model", "x y"]);
+        assert_eq!(tmux.as_deref(), Some("coding"));
+        assert!(Cli::try_parse_from(["agentdrop", "run", "dev"]).is_err());
     }
 }

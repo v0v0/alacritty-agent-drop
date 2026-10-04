@@ -1,6 +1,6 @@
 [package]
 name = "alacritty-agent-drop"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Drag and paste local images into remote agent CLIs through Alacritty and tssh"
 license = "MIT"
@@ -22,6 +22,9 @@ uuid = { version = "1", features = ["v4"] }
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 arboard = { version = "3.6.1", default-features = false, features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = "thin"
