@@ -46,7 +46,10 @@ class Terminal:
         return self.output
 
     def ready(self):
-        until(lambda: b"AGENT_READY" in self.drain())
+        try:
+            until(lambda: b"AGENT_READY" in self.drain())
+        except AssertionError as error:
+            raise AssertionError(f"Agent did not start; terminal output: {self.drain()!r}") from error
 
     def send(self, data):
         os.write(self.fd, data)
